@@ -1,0 +1,15 @@
+{
+  "name": "ESP32_MySQL",
+  "version": "0.1.0",
+  "keywords": "Communication, Database, Storage, MySQL, wifi",
+  "description": "Connects to MySQL using ESP32",
+  "url":"https://github.com/Syafiqlim/ESP32_MySQL",
+  "authors": [
+    {
+      "name":  "Syafiqlim",
+      "url":   "https://github.com/Syafiqlim",
+      "email": "syafiqmuhammad588@gmail.com",
+      "maintainer": true
+    }
+  ]
+}
