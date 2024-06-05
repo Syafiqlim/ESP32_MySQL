@@ -1,7 +1,21 @@
-/**************************** 
+/*
+ * ESP32_MySQL - An optimized library for ESP32 to directly connect and execute SQL to MySQL database without intermediary.
+ * 
+ * Copyright (c) 2024 Syafiqlim
+ * 
+ * This software is released under the MIT License.
+ * https://opensource.org/licenses/MIT
+ */
+
+/****************************************************** 
   ESP32_MySQL.h
   by Syafiqlim @ syafiqlimx
-*****************************/
+
+  modification :
+  v1.0.0 -
+  Add #include <ESP32_MySQL_Sha256.h>
+  Add #include <ESP32_MySQL_Aes256_Impl.h>
+*******************************************************/
 
 #pragma once
 

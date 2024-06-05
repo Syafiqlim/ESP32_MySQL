@@ -1,14 +1,23 @@
+/*
+ * ESP32_MySQL - An optimized library for ESP32 to directly connect and execute SQL to MySQL database without intermediary.
+ * 
+ * Copyright (c) 2024 Syafiqlim
+ * 
+ * This software is released under the MIT License.
+ * https://opensource.org/licenses/MIT
+ */
+
 /*********************************************************************************************************************************
-  Variable_Insert_ESP32.ino
+  Variable_Insert_ESP32MySQL.ino
   by Syafiqlim @ syafiqlimx
 
  **********************************************************************************************************************************/
 /*
   INSTRUCTIONS FOR USE
 
-  1) Change the address of the server to the IP address of the MySQL server
-  2) Change the user and password to a valid MySQL user and password
-  3) Change the SSID and pass to match your WiFi network
+  1) Change the address of the server to the IP address of the MySQL server in Credentials.h
+  2) Change the user and password to a valid MySQL user and password in Credentials.h
+  3) Change the SSID and pass to match your WiFi network in Credentials.h
   4) Change the default DB, default table, default column and default value according to your DB schema
   5) Implement functions for sensors reading or whatsoever
   6) Connect a USB cable to your ESP32
@@ -32,7 +41,7 @@
   // Optional using hostname
   char server[] = "xxxxx.com"; // change to your server's hostname/URL
 #else
-  IPAddress server(128, 888, 001, 010);
+  IPAddress server(128, 100, 001, 010);
 #endif
 
 uint16_t server_port = 19662;    //MySQL server port (default : 3306)

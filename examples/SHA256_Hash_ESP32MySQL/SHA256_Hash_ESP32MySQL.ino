@@ -1,15 +1,24 @@
+/*
+ * ESP32_MySQL - An optimized library for ESP32 to directly connect and execute SQL to MySQL database without intermediary.
+ * 
+ * Copyright (c) 2024 Syafiqlim
+ * 
+ * This software is released under the MIT License.
+ * https://opensource.org/licenses/MIT
+ */
+
 /*********************************************************************************************************************************
-  Basic_Insert_ESP32.ino
+  SHA256_Hash_ESP32MySQL.ino
   by Syafiqlim @ syafiqlimx
 
  **********************************************************************************************************************************/
 /*
   INSTRUCTIONS FOR USE
 
-  1) Change the address of the server to the IP address of the MySQL server
-  2) Change the user and password to a valid MySQL user and password
-  3) Change the SSID and pass to match your WiFi network
-  4) Change the default DB, default table, default column and default value according to your DB schema
+  1) Change the address of the server to the IP address of the MySQL server in Credentials.h
+  2) Change the user and password to a valid MySQL user and password in Credentials.h
+  3) Change the SSID and pass to match your WiFi network in Credentials.h
+  4) Change the default DB, table, columns and value according to your DB schema and message you want to hash
   5) Connect a USB cable to your ESP32
   6) Select the correct board and port
   7) Compile and upload the sketch to your ESP32
@@ -17,6 +26,7 @@
 
 */
 
+#include <ESP32_MySQL.h>
 #include "Credentials.h"
 
 #define ESP32_MYSQL_DEBUG_PORT      Serial
@@ -24,29 +34,19 @@
 // Debug Level from 0 to 4
 #define _ESP32_MYSQL_LOGLEVEL_      1
 
-#include <ESP32_MySQL.h>
-
 #define USING_HOST_NAME     true
 
 #if USING_HOST_NAME
-  // Optional using hostname
-  char server[] = "xxxxxx.com"; // change to your server's hostname/URL
+  // hostname or IPv4 address of MySQL server
+  char server[] = "xxxx.com"; // change to your server's hostname/URL
 #else
-  IPAddress server(128, 888, 001, 010);
+  IPAddress server(128, 100, 001, 010);
 #endif
 
-uint16_t server_port = 14014;    // MySQL server port (default : 3306)
+uint16_t server_port = 14014;    // default MySQL port = 3306
 
-char default_database[] = "DB0";           //default DB
-char default_table[]    = "TEST0x00";          //default table
-
-char default_column[] = "data0";   //default column
-
-String default_value    = "sayangAin";    //default value (make sure datatype same with column of DB table, like you can use String for VARCHAR)
-
-// Sample query
-String INSERT_SQL = String("INSERT INTO ") + default_database + "." + default_table 
-                 + " (" + default_column + ")" + " VALUES ('" + default_value + "')";
+char default_database[] = "DB0";           //insert default DB
+char default_table[]    = "TEST0x00";          //insert default table
 
 ESP32_MySQL_Connection conn((Client *)&client);
 
@@ -55,6 +55,7 @@ ESP32_MySQL_Query *query_mem;
 void setup()
 {
   Serial.begin(115200);
+
   while (!Serial && millis() < 5000); // wait for serial port to connect
 
   ESP32_MYSQL_DISPLAY1("\nStarting Basic_Insert_ESP on", ARDUINO_BOARD);
@@ -77,9 +78,31 @@ void setup()
   ESP32_MYSQL_DISPLAY5("User =", user, ", PW =", password, ", DB =", default_database);
 }
 
-void runInsert()
+void SHAyang(const uint8_t *data, uint32_t len, uint8_t *hashed_value) {
+    ESP32_MySQL_SHA256 shayang; // object instantiation (as shayang) <3
+    shayang.update(data, len);
+    shayang.final(hashed_value);
+}
+
+void hashAndInsert()
 {
-  // Initiate the query class instance
+  // Message to hash
+    const char* plaintext = "sayangAin";
+    uint8_t hashed_value[SHA256_HASH_SIZE];
+
+    // Perform ESP32_MySQL_SHA-256 hashing
+    SHAyang((const uint8_t*)plaintext, strlen(plaintext), hashed_value);
+
+    // Convert hash to string with proper padding
+    String hashedString = "";
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) {
+        if (hashed_value[i] < 0x10) hashedString += "0"; 
+        hashedString += String(hashed_value[i], HEX);
+    }
+
+// Sample query
+String INSERT_SQL = String("INSERT INTO ") + default_database + "." + default_table +
+                    " (data0) VALUES ('" + hashedString + "');";
   ESP32_MySQL_Query query_mem = ESP32_MySQL_Query(&conn);
 
   if (conn.connected())
@@ -110,7 +133,7 @@ void loop()
   if (conn.connectNonBlocking(server, server_port, user, password) != RESULT_FAIL)
   {
     delay(500);
-    runInsert();
+    hashAndInsert();
     conn.close();                     // close the connection
   } 
   else 
@@ -120,6 +143,6 @@ void loop()
 
   ESP32_MYSQL_DISPLAY("\nSleeping...");
   ESP32_MYSQL_DISPLAY("================================================");
- 
-  delay(10000); // every 10 seconds
+
+  delay(10000);
 }
