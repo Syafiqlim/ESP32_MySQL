@@ -1,7 +1,7 @@
 # ESP32_MySQL
 
 [![arduino-library-badge](https://www.ardu-badge.com/badge/ESP32_MySQL.svg?)](https://www.ardu-badge.com/ESP32_MySQL)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Syafiqlim/ESP32_MySQL/blob/main/LICENSE)
 [![GitHub release](https://img.shields.io/github/release/Syafiqlim/ESP32_MySQL.svg)](https://GitHub.com/Syafiqlim/ESP32_MySQL/releases/)
 
 Optimized library for ESP32 to directly connect and execute SQL to MySQL database WITHOUT any intermediary like HTTP server.
