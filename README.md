@@ -15,10 +15,6 @@ Optimized library for ESP32 to directly connect and execute SQL to MySQL databas
   - [Using Arduino Library Manager](#using-arduino-library-manager)
   - [Manual Installation](#manual-installation)
 - [Examples](#examples)
-- [API Reference](#api-reference)
-  - [`begin()`](#begin)
-  - [`methodName()`](#methodname)
-- [Contributing](#contributing)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 
