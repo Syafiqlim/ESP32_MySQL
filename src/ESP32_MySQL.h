@@ -18,5 +18,7 @@
 #include <ESP32_MySQL_Query_Impl.h>
 #include <ESP32_MySQL_Encrypt_Sha1_Impl.h>
 #include <ESP32_MySQL_Packet_Impl.h>
+#include <ESP32_MySQL_Sha256.h>
+#include <ESP32_MySQL_Aes256_Impl.h>
  
 #endif    //ESP32_MYSQL_H
