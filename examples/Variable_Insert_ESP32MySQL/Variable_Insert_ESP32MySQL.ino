@@ -97,7 +97,7 @@ void runInsert()
   {
     ESP32_MYSQL_DISPLAY("Database connected. Inserting data...");
     String INSERT_SQL = String("INSERT INTO ") + default_database + "." + default_table 
-                 + " (" + pH_column + temp_column + ") VALUES (" + pHValue + ", " + temp + ");";
+                 + " (" + pH_column + "," + temp_column + ") VALUES (" + pHValue + ", " + temp + ");";
     ESP32_MYSQL_DISPLAY(INSERT_SQL);
     
     // Execute the query
