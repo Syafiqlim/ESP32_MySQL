@@ -111,14 +111,10 @@ bool ESP32_MySQL_Connection::connect(const char *hostname, const uint16_t& port,
   {
     ESP32_MYSQL_LOGERROR("Can't connect. Error reading auth packets");
   }
-	else if (get_packet_type() != ESP32_MYSQL_OK_PACKET)
+  else if (handle_authentication_result())
   {
-    parse_error_packet();
-  }
-  else
-  {
-  	ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
-  	returnVal = true;
+    ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
+    returnVal = true;
   }
 
 	if (server_version)
@@ -197,14 +193,10 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const char *hostnam
   {
     ESP32_MYSQL_LOGERROR("Can't connect. Error reading auth packets");
   }
-	else if (get_packet_type() != ESP32_MYSQL_OK_PACKET)
+  else if (handle_authentication_result())
   {
-    parse_error_packet();
-  }
-  else
-  {
-  	ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
-  	returnVal = RESULT_OK;
+    ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
+    returnVal = RESULT_OK;
   }
 
 	if (server_version)
@@ -228,6 +220,56 @@ bool ESP32_MySQL_Connection::connect(const IPAddress& server, const uint16_t& po
 Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const IPAddress& server, const uint16_t& port, char *user, char *password, char *db)
 {
 	return connectNonBlocking(SQL_IPAddressToString(server).c_str(), port, user, password, db);
+}
+
+//////////////////////////////////////////////////////////////
+
+bool ESP32_MySQL_Connection::handle_authentication_result()
+{
+  const int type = get_packet_type();
+
+  if (type == ESP32_MYSQL_OK_PACKET)
+    return true;
+
+  if (type == ESP32_MYSQL_ERROR_PACKET)
+  {
+    parse_error_packet();
+    return false;
+  }
+
+  if ((auth_plugin_type == AUTH_CACHING_SHA2_PASSWORD) && buffer && (packet_len >= 2))
+  {
+    // caching_sha2_password returns small packets with auth stage markers
+    if (buffer[4] == 0x01)
+    {
+      const uint8_t auth_step = buffer[5];
+
+      if (auth_step == 0x03)
+      {
+        ESP32_MYSQL_LOGINFO("caching_sha2 fast auth accepted, waiting for final OK");
+
+        if (!read_packet())
+        {
+          ESP32_MYSQL_LOGERROR("Failed reading final OK packet after fast auth");
+          return false;
+        }
+
+        if (get_packet_type() == ESP32_MYSQL_OK_PACKET)
+          return true;
+
+        parse_error_packet();
+        return false;
+      }
+      else if (auth_step == 0x04)
+      {
+        ESP32_MYSQL_LOGERROR("Server requested full authentication (caching_sha2_password) which requires RSA or TLS and is not implemented here");
+        return false;
+      }
+    }
+  }
+
+  ESP32_MYSQL_LOGERROR1("Unexpected auth response, packet type =", type);
+  return false;
 }
 
 //////////////////////////////////////////////////////////////

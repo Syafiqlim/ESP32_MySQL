@@ -25,7 +25,15 @@
 #define ESP32_MYSQL_ERROR_PACKET      0xff
 
 #define MAX_TRANSMISSION_UNIT   1500
-//////
+///////
+
+enum AuthPlugin
+{
+  AUTH_MYSQL_NATIVE_PASSWORD = 0,
+  AUTH_CACHING_SHA2_PASSWORD,
+  AUTH_SHA256_PASSWORD,
+  AUTH_UNKNOWN
+};
 
 class MySQL_Packet 
 {
@@ -38,6 +46,10 @@ class MySQL_Packet
     int packet_len;         // length of current packet
     Client *client;         // instance of client class (e.g. EthernetClient)
     char *server_version;   // save server version from handshake
+    char  auth_plugin[32];  // authentication plugin name advertised by server
+    uint8_t auth_plugin_data_len = 0;
+    uint32_t server_capabilities = 0;
+    AuthPlugin auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
 
     MySQL_Packet(Client *client_instance);
     virtual ~MySQL_Packet()
@@ -59,6 +71,10 @@ class MySQL_Packet
     bool    complete_handshake(char *user, char *password);
     void    send_authentication_packet(char *user, char *password, char *db = NULL);
     void    parse_handshake_packet();
+    AuthPlugin get_auth_plugin() const
+    {
+      return auth_plugin_type;
+    }
     bool    scramble_password(char *password, byte *pwd_hash);
 
     bool    read_packet();
@@ -75,6 +91,9 @@ class MySQL_Packet
 
   private:
     byte seed[20];
+    bool scramble_password_caching_sha2(char *password, byte *pwd_hash);
+    bool scramble_password_sha256(char *password, byte *pwd_hash);
+    AuthPlugin plugin_from_name(const char *name) const;
 };
 
 

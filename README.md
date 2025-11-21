@@ -63,6 +63,11 @@ I found a library, which is MySQL_MariaDB_Generic library by Dr. Charles Bell an
     <img src="https://i.postimg.cc/W3KZLHrb/ESP32-My-SQL-SHA256.png">
 </p>
 
+### Authentication
+
+- Supports both `mysql_native_password` and the MySQL 8+ default `caching_sha2_password` (fast-auth path) during the initial handshake.
+- Full RSA/TLS based authentication for `sha256_password` or `caching_sha2_password` full-auth is not yet implemented; servers requesting that path will reject the login.
+
 ## Installation
 
 ### Using Arduino Library Manager

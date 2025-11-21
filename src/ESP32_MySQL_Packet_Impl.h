@@ -20,6 +20,7 @@
 #include <Arduino.h>
 
 #include <ESP32_MySQL_Encrypt_Sha1.h>
+#include <ESP32_MySQL_Sha256.h>
 
 #if ( USING_WIFI_ESP_AT )
   #define ESP32_MYSQL_DATA_TIMEOUT  10000   
@@ -29,6 +30,19 @@
 //////
 
 #define ESP32_MYSQL_WAIT_INTERVAL 300    // WiFi client wait interval
+
+// Minimal subset of capability bits we need when crafting the handshake response
+#define CLIENT_LONG_PASSWORD                   0x00000001UL
+#define CLIENT_FOUND_ROWS                      0x00000002UL
+#define CLIENT_LONG_FLAG                       0x00000004UL
+#define CLIENT_CONNECT_WITH_DB                 0x00000008UL
+#define CLIENT_PROTOCOL_41                     0x00000200UL
+#define CLIENT_INTERACTIVE                     0x00000400UL
+#define CLIENT_TRANSACTIONS                    0x00002000UL
+#define CLIENT_SECURE_CONNECTION               0x00008000UL
+#define CLIENT_MULTI_STATEMENTS                0x00010000UL
+#define CLIENT_MULTI_RESULTS                   0x00020000UL
+#define CLIENT_PLUGIN_AUTH                     0x00080000UL
 
 /*
   Constructor
@@ -40,6 +54,11 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
 	buffer = NULL;
 	server_version = NULL;
 	client = client_instance;
+	memset(auth_plugin, 0, sizeof(auth_plugin));
+	auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
+	auth_plugin_data_len = 0;
+	server_capabilities = 0;
+	memset(seed, 0, sizeof(seed));
 }
 
 /*
@@ -74,15 +93,12 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
 void MySQL_Packet::send_authentication_packet(char *user, char *password, char *db)
 { 
   byte this_buffer[256];
-  byte scramble[20];
+  byte scramble[SHA256_HASH_SIZE];
 
   int size_send = 4;
+  uint32_t client_flags = 0x0003A60D | CLIENT_PLUGIN_AUTH;
 
-  // client flags
-  this_buffer[size_send] = byte(0x0D);
-  this_buffer[size_send + 1] = byte(0xa6);
-  this_buffer[size_send + 2] = byte(0x03);
-  this_buffer[size_send + 3] = byte(0x00);
+  store_int(&this_buffer[size_send], client_flags, 4);
   size_send += 4;
 
   // max_allowed_packet
@@ -96,7 +112,7 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   this_buffer[size_send] = byte(0x08);
   size_send += 1;
 
-  for (int i = 0; i < 24; i++)
+  for (int i = 0; i < 23; i++)
     this_buffer[size_send + i] = 0x00;
 
   size_send += 23;
@@ -105,30 +121,61 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   memcpy((char *) &this_buffer[size_send], user, strlen(user));
   size_send += strlen(user) + 1;
   this_buffer[size_send - 1] = 0x00;
-   
-  if (scramble_password(password, scramble)) 
+
+  AuthPlugin plugin = (auth_plugin_type == AUTH_UNKNOWN) ? AUTH_MYSQL_NATIVE_PASSWORD : auth_plugin_type;
+  bool has_scramble = false;
+  uint8_t scramble_len = 0;
+
+  if (plugin == AUTH_CACHING_SHA2_PASSWORD)
   {
-    this_buffer[size_send] = 0x14;
-    size_send += 1;
-    
-    for (int i = 0; i < 20; i++)
-      this_buffer[i + size_send] = scramble[i];
-      
-    size_send += 20;
-    this_buffer[size_send] = 0x00;
+    has_scramble = scramble_password_caching_sha2(password, scramble);
+    scramble_len = SHA256_HASH_SIZE;
   }
-  
-  if (db) 
+  else if (plugin == AUTH_SHA256_PASSWORD)
   {
-    memcpy((char *)&this_buffer[size_send], db, strlen(db));
+    has_scramble = scramble_password_sha256(password, scramble);
+    scramble_len = SHA256_HASH_SIZE;
+  }
+  else
+  {
+    has_scramble = scramble_password(password, scramble);
+    scramble_len = 20;
+  }
+
+  if (has_scramble)
+  {
+    this_buffer[size_send] = scramble_len;
+    size_send += 1;
+
+    for (uint8_t i = 0; i < scramble_len; i++)
+      this_buffer[i + size_send] = scramble[i];
+
+    size_send += scramble_len;
+  }
+  else
+  {
+    this_buffer[size_send] = 0x00;
+    size_send += 1;
+  }
+
+  if (db)
+  {
+    memcpy((char *) &this_buffer[size_send], db, strlen(db));
     size_send += strlen(db) + 1;
     this_buffer[size_send - 1] = 0x00;
-  } 
-  else 
+  }
+  else
   {
-    this_buffer[size_send + 1] = 0x00;
+    this_buffer[size_send] = 0x00;
     size_send += 1;
   }
+
+  // Authentication plugin name (makes the server honor our scramble choice)
+  const char *plugin_name = (auth_plugin[0] != 0) ? auth_plugin : "mysql_native_password";
+  const size_t plugin_len = strlen(plugin_name);
+
+  memcpy(&this_buffer[size_send], plugin_name, plugin_len + 1);
+  size_send += plugin_len + 1;
 
   // Write packet size
   int p_size = size_send - 4;
@@ -136,8 +183,8 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   this_buffer[3] = byte(0x01);
 
   // Write the packet
-  ESP32_MYSQL_LOGINFO1("Writing this_buffer, size_send =", size_send);
-  
+  ESP32_MYSQL_LOGINFO1("Writing authentication packet, size =", size_send);
+
   client->write((uint8_t*)this_buffer, size_send);
   client->flush();
 }
@@ -191,6 +238,40 @@ bool MySQL_Packet::scramble_password(char *password, byte *pwd_hash)
     pwd_hash[i] = hash1[i] ^ hash3[i];
 
   return true;
+}
+
+bool MySQL_Packet::scramble_password_caching_sha2(char *password, byte *pwd_hash)
+{
+  if (!password || (strlen(password) == 0))
+    return false;
+
+  uint8_t hash1[SHA256_HASH_SIZE];
+  uint8_t hash2[SHA256_HASH_SIZE];
+  uint8_t hash3[SHA256_HASH_SIZE];
+
+  ESP32_MySQL_SHA256 sha256;
+  sha256.update((uint8_t *) password, strlen(password));
+  sha256.final(hash1);
+
+  ESP32_MySQL_SHA256 sha256_second;
+  sha256_second.update(hash1, SHA256_HASH_SIZE);
+  sha256_second.final(hash2);
+
+  ESP32_MySQL_SHA256 sha256_third;
+  sha256_third.update(hash2, SHA256_HASH_SIZE);
+  sha256_third.update(seed, 20);
+  sha256_third.final(hash3);
+
+  for (int i = 0; i < SHA256_HASH_SIZE; i++)
+    pwd_hash[i] = hash1[i] ^ hash3[i];
+
+  return true;
+}
+
+bool MySQL_Packet::scramble_password_sha256(char *password, byte *pwd_hash)
+{
+  // sha256_password requires the same scramble as caching_sha2_password for the fast auth path.
+  return scramble_password_caching_sha2(password, pwd_hash);
 }
 
 /*
@@ -395,39 +476,129 @@ void MySQL_Packet::parse_handshake_packet()
     return;
   }
 
-  int i = 5;
+  // Reset state from any previous handshake
+  memset(seed, 0, sizeof(seed));
+  memset(auth_plugin, 0, sizeof(auth_plugin));
+  auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
+  auth_plugin_data_len = 0;
+  server_capabilities = 0;
 
-  do
-  {
-    i++;
-  } while (buffer[i - 1] != 0x00);
+  // Payload starts after the 4-byte packet header
+  size_t offset = 4;
+  const size_t end = packet_len + 4;
 
-  if (i > 5)
+  if (offset >= end)
+    return;
+
+  // Skip protocol version
+  offset++;
+
+  // Read server version string (null-terminated)
+  size_t version_start = offset;
+
+  while ((offset < end) && (buffer[offset] != 0x00))
+    offset++;
+
+  if (offset > version_start)
   {
-    server_version = (char *) malloc(i - 5);
+    size_t ver_len = offset - version_start;
 
     if (server_version)
     {
-      strncpy(server_version, (char *) &buffer[5], i - 5);
-      server_version[i - 5 - 1] = 0;
+      free(server_version);
+      server_version = NULL;
+    }
+
+    server_version = (char *) malloc(ver_len + 1);
+
+    if (server_version)
+    {
+      memcpy(server_version, &buffer[version_start], ver_len);
+      server_version[ver_len] = 0;
     }
   }
 
-  // Capture the first 8 characters of seed
-  i += 4; // Skip thread id
+  // Skip the null terminator
+  offset++;
 
-  for (int j = 0; j < 8; j++)
+  if (offset + 4 > end)
+    return;
+
+  // Thread id
+  offset += 4;
+
+  // Scramble part 1 (8 bytes)
+  for (int j = 0; (j < 8) && (offset + j < end); j++)
   {
-    seed[j] = buffer[i + j];
+    seed[j] = buffer[offset + j];
   }
 
-  // Capture rest of seed
-  i += 27; // skip ahead
+  offset += 8;
 
-  for (int j = 0; j < 12; j++)
+  // Filler
+  offset++;
+
+  if (offset + 2 > end)
+    return;
+
+  server_capabilities = buffer[offset] | (buffer[offset + 1] << 8);
+  offset += 2;
+
+  // Charset
+  offset++;
+
+  // Status flags
+  offset += 2;
+
+  if (offset + 2 > end)
+    return;
+
+  server_capabilities |= ((uint32_t) (buffer[offset] | (buffer[offset + 1] << 8))) << 16;
+  offset += 2;
+
+  if (offset < end)
   {
-    seed[j + 8] = buffer[i + j];
+    auth_plugin_data_len = buffer[offset];
+    offset++;
   }
+
+  // Reserved bytes
+  offset += 10;
+
+  size_t second_seed_len = (auth_plugin_data_len > 0) ? max((int) auth_plugin_data_len - 8, 12) : 12;
+  const size_t available_seed_bytes = (offset < end) ? min(second_seed_len, end - offset) : 0;
+
+  for (size_t j = 0; (j < 12) && (j < available_seed_bytes); j++)
+  {
+    seed[j + 8] = buffer[offset + j];
+  }
+
+  offset += available_seed_bytes;
+
+  if (offset < end)
+  {
+    size_t plugin_start = offset;
+
+    while ((offset < end) && (buffer[offset] != 0x00))
+      offset++;
+
+    size_t plugin_len = (offset > plugin_start) ? min((size_t) (sizeof(auth_plugin) - 1), offset - plugin_start) : 0;
+
+    if (plugin_len > 0)
+    {
+      memcpy(auth_plugin, &buffer[plugin_start], plugin_len);
+      auth_plugin[plugin_len] = 0;
+    }
+  }
+
+  if (auth_plugin[0] == 0)
+  {
+    strncpy(auth_plugin, "mysql_native_password", sizeof(auth_plugin) - 1);
+    auth_plugin[sizeof(auth_plugin) - 1] = 0;
+  }
+
+  auth_plugin_type = plugin_from_name(auth_plugin);
+  ESP32_MYSQL_LOGINFO1("Auth plugin from server:", auth_plugin);
 }
 
 /*
@@ -465,6 +636,23 @@ void MySQL_Packet::parse_error_packet()
   }
     
   ESP32_MYSQL_LOGDEBUG0LN(".");
+}
+
+AuthPlugin MySQL_Packet::plugin_from_name(const char *name) const
+{
+  if (!name || (strlen(name) == 0))
+    return AUTH_UNKNOWN;
+
+  if (strcmp(name, "mysql_native_password") == 0)
+    return AUTH_MYSQL_NATIVE_PASSWORD;
+
+  if (strcmp(name, "caching_sha2_password") == 0)
+    return AUTH_CACHING_SHA2_PASSWORD;
+
+  if (strcmp(name, "sha256_password") == 0)
+    return AUTH_SHA256_PASSWORD;
+
+  return AUTH_UNKNOWN;
 }
 
 
