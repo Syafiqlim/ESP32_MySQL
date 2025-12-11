@@ -390,6 +390,11 @@ bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len
   for (size_t i = 0; i < pw_len; i++)
     plain[i] = ((uint8_t) password[i]) ^ seed[i % 20];
 
+  bool ok = false;
+  int ret = 0;
+  size_t rsa_len = 0;
+  mbedtls_rsa_context *rsa = NULL;
+
   mbedtls_pk_context pk;
   mbedtls_ctr_drbg_context ctr_drbg;
   mbedtls_entropy_context entropy;
@@ -399,12 +404,12 @@ bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len
   mbedtls_entropy_init(&entropy);
 
   const char *pers = "esp32_mysql_rsa";
-  int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers, strlen(pers));
+  ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers, strlen(pers));
 
   if (ret != 0)
   {
     ESP32_MYSQL_LOGERROR1("RSA seed failed, code =", ret);
-    goto cleanup;
+    goto cleanup_labels;
   }
 
   ret = mbedtls_pk_parse_public_key(&pk, pubkey, pubkey_len);
@@ -412,26 +417,26 @@ bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len
   if (ret != 0)
   {
     ESP32_MYSQL_LOGERROR1("Parse RSA public key failed, code =", ret);
-    goto cleanup;
+    goto cleanup_labels;
   }
 
   if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_RSA))
   {
     ESP32_MYSQL_LOGERROR("Public key is not RSA");
     ret = -1;
-    goto cleanup;
+    goto cleanup_labels;
   }
 
-  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(pk);
+  rsa = mbedtls_pk_rsa(pk);
   mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
 
-  size_t rsa_len = mbedtls_pk_get_len(&pk);
+  rsa_len = mbedtls_pk_get_len(&pk);
 
   if (rsa_len == 0)
   {
     ESP32_MYSQL_LOGERROR("Invalid RSA modulus length");
     ret = -1;
-    goto cleanup;
+    goto cleanup_labels;
   }
 
   ret = mbedtls_pk_encrypt(&pk,
@@ -446,16 +451,17 @@ bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len
   if (ret != 0)
   {
     ESP32_MYSQL_LOGERROR1("RSA encrypt failed, code =", ret);
-    goto cleanup;
+    goto cleanup_labels;
   }
+  ok = true;
 
-cleanup:
+cleanup_labels:
   mbedtls_pk_free(&pk);
   mbedtls_ctr_drbg_free(&ctr_drbg);
   mbedtls_entropy_free(&entropy);
   free(plain);
 
-  return ret == 0;
+  return ok && (ret == 0);
 #else
   (void) pubkey;
   (void) pubkey_len;
