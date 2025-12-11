@@ -10,6 +10,7 @@
 #include <ESP32_MySQL.h>
 
 #define USING_HOST_NAME true
+#define USE_TLS        true
 
 #if USING_HOST_NAME
   char server[] = "your-db-host.example.com";   // change to your server's hostname/URL
@@ -36,6 +37,14 @@ void setup()
 {
   Serial.begin(115200);
   while (!Serial && millis() < 5000);
+
+#if USE_TLS
+  #if USING_HOST_NAME
+    conn.enable_tls(true, server);   // Request TLS and pass hostname for SNI
+  #else
+    conn.enable_tls(true);
+  #endif
+#endif
 
   Serial.println("\nAuth test (mysql_native_password user)");
 

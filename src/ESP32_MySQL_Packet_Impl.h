@@ -30,12 +30,14 @@
 //////
 
 #define ESP32_MYSQL_WAIT_INTERVAL 300    // WiFi client wait interval
+#define ESP32_MYSQL_TLS_TIMEOUT_MS 10000
 
 // Minimal subset of capability bits we need when crafting the handshake response
 #define CLIENT_LONG_PASSWORD                   0x00000001UL
 #define CLIENT_FOUND_ROWS                      0x00000002UL
 #define CLIENT_LONG_FLAG                       0x00000004UL
 #define CLIENT_CONNECT_WITH_DB                 0x00000008UL
+#define CLIENT_SSL                             0x00000800UL
 #define CLIENT_PROTOCOL_41                     0x00000200UL
 #define CLIENT_INTERACTIVE                     0x00000400UL
 #define CLIENT_TRANSACTIONS                    0x00002000UL
@@ -58,7 +60,331 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
 	auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
 	auth_plugin_data_len = 0;
 	server_capabilities = 0;
-	memset(seed, 0, sizeof(seed));
+  memset(seed, 0, sizeof(seed));
+#if defined(ESP32)
+  mbedtls_ssl_init(&tls_ctx);
+  mbedtls_ssl_config_init(&tls_conf);
+  mbedtls_ctr_drbg_init(&tls_ctr_drbg);
+  mbedtls_entropy_init(&tls_entropy);
+#endif
+  memset(tls_sni_host, 0, sizeof(tls_sni_host));
+  tls_requested = false;
+  tls_established = false;
+  ssl_request_sent = false;
+  next_sequence_id = 0x01;
+}
+
+uint32_t MySQL_Packet::build_client_flags(bool use_tls) const
+{
+  uint32_t flags = 0x0003A60D | CLIENT_PLUGIN_AUTH;
+
+  if (use_tls)
+    flags |= CLIENT_SSL;
+
+  return flags;
+}
+
+bool MySQL_Packet::cleanup_tls()
+{
+#if defined(ESP32)
+  mbedtls_ssl_free(&tls_ctx);
+  mbedtls_ssl_config_free(&tls_conf);
+  mbedtls_ctr_drbg_free(&tls_ctr_drbg);
+  mbedtls_entropy_free(&tls_entropy);
+  tls_established = false;
+  return true;
+#else
+  return false;
+#endif
+}
+
+int MySQL_Packet::tls_send_cb(void *ctx, const unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  MySQL_Packet *self = static_cast<MySQL_Packet *>(ctx);
+
+  if (!self || !self->client)
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+
+  size_t written = self->client->write(buf, len);
+
+  return (written > 0) ? (int) written : MBEDTLS_ERR_NET_SEND_FAILED;
+#else
+  (void) ctx;
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::tls_recv_cb(void *ctx, unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  MySQL_Packet *self = static_cast<MySQL_Packet *>(ctx);
+
+  if (!self || !self->client)
+    return MBEDTLS_ERR_NET_RECV_FAILED;
+
+  unsigned long start = millis();
+
+  while ((self->client->available() == 0) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    delay(1);
+    yield();
+  }
+
+  if (self->client->available() == 0)
+    return MBEDTLS_ERR_SSL_TIMEOUT;
+
+  int received = self->client->read(buf, len);
+
+  if (received <= 0)
+    return MBEDTLS_ERR_NET_RECV_FAILED;
+
+  return received;
+#else
+  (void) ctx;
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::blocking_read(unsigned char *buf, size_t len)
+{
+  if (!client)
+    return -1;
+
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int avail = client->available();
+
+    if (avail > 0)
+    {
+      int read_now = client->read(buf + offset, len - offset);
+
+      if (read_now > 0)
+        offset += read_now;
+    }
+    else
+    {
+      delay(1);
+      yield();
+    }
+  }
+
+  return offset;
+}
+
+int MySQL_Packet::blocking_read_tls(unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int ret = mbedtls_ssl_read(&tls_ctx, buf + offset, len - offset);
+
+    if (ret > 0)
+    {
+      offset += ret;
+    }
+    else if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      delay(1);
+      yield();
+      continue;
+    }
+    else
+    {
+      return ret;
+    }
+  }
+
+  return offset;
+#else
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::blocking_write_tls(const unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int ret = mbedtls_ssl_write(&tls_ctx, buf + offset, len - offset);
+
+    if (ret > 0)
+    {
+      offset += ret;
+    }
+    else if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      delay(1);
+      yield();
+      continue;
+    }
+    else
+    {
+      return ret;
+    }
+  }
+
+  return offset;
+#else
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+bool MySQL_Packet::write_bytes(const uint8_t *data, size_t len)
+{
+  if (!client || (data == NULL))
+    return false;
+
+  if (tls_established)
+  {
+    int ret = blocking_write_tls(data, len);
+    return ret == (int) len;
+  }
+
+  size_t written = client->write(data, len);
+
+  return written == len;
+}
+
+bool MySQL_Packet::read_bytes(uint8_t *out, size_t len)
+{
+  if (!client || (out == NULL))
+    return false;
+
+  int ret = tls_established ? blocking_read_tls(out, len) : blocking_read(out, len);
+
+  return ret == (int) len;
+}
+
+bool MySQL_Packet::send_ssl_request(uint32_t client_flags, uint8_t sequence_id)
+{
+  // SSL Request packet: header (4 bytes) + payload (32 bytes)
+  uint8_t packet[4 + 32];
+  size_t offset = 0;
+
+  // Packet length (payload only)
+  store_int(packet, 32, 3);
+  packet[3] = sequence_id;
+  offset = 4;
+
+  store_int(&packet[offset], client_flags | CLIENT_SSL, 4);
+  offset += 4;
+
+  // max_allowed_packet (little endian). Keep minimal 1MB default style (0x01000000).
+  packet[offset + 0] = 0x00;
+  packet[offset + 1] = 0x00;
+  packet[offset + 2] = 0x00;
+  packet[offset + 3] = 0x01;
+  offset += 4;
+
+  // charset - default 8 (latin1)
+  packet[offset++] = byte(0x08);
+
+  // filler
+  for (int i = 0; i < 23; i++)
+    packet[offset + i] = 0x00;
+
+  offset += 23;
+
+  ssl_request_sent = write_bytes(packet, offset);
+
+  if (ssl_request_sent)
+    next_sequence_id = sequence_id + 1;
+
+  return ssl_request_sent;
+}
+
+bool MySQL_Packet::start_tls_handshake()
+{
+#if defined(ESP32)
+  cleanup_tls();
+
+  mbedtls_ssl_init(&tls_ctx);
+  mbedtls_ssl_config_init(&tls_conf);
+  mbedtls_ctr_drbg_init(&tls_ctr_drbg);
+  mbedtls_entropy_init(&tls_entropy);
+
+  const char *pers = "esp32_mysql_tls";
+  int ret = mbedtls_ctr_drbg_seed(&tls_ctr_drbg, mbedtls_entropy_func, &tls_entropy, (const unsigned char *) pers, strlen(pers));
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS seed failed, code =", ret);
+    return false;
+  }
+
+  ret = mbedtls_ssl_config_defaults(&tls_conf,
+                                    MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS config defaults failed, code =", ret);
+    return false;
+  }
+
+  mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_rng(&tls_conf, mbedtls_ctr_drbg_random, &tls_ctr_drbg);
+
+  ret = mbedtls_ssl_setup(&tls_ctx, &tls_conf);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS setup failed, code =", ret);
+    return false;
+  }
+
+  if (tls_sni_host[0] != 0)
+    mbedtls_ssl_set_hostname(&tls_ctx, tls_sni_host);
+
+  mbedtls_ssl_set_bio(&tls_ctx, this, tls_send_cb, tls_recv_cb, NULL);
+
+  unsigned long start = millis();
+
+  while ((ret = mbedtls_ssl_handshake(&tls_ctx)) != 0)
+  {
+    if ((ret != MBEDTLS_ERR_SSL_WANT_READ) && (ret != MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      ESP32_MYSQL_LOGERROR1("TLS handshake failed, code =", ret);
+      cleanup_tls();
+      return false;
+    }
+
+    if ((millis() - start) > ESP32_MYSQL_TLS_TIMEOUT_MS)
+    {
+      ESP32_MYSQL_LOGERROR("TLS handshake timeout");
+      cleanup_tls();
+      return false;
+    }
+
+    delay(1);
+    yield();
+  }
+
+  tls_established = true;
+  return true;
+#else
+  ESP32_MYSQL_LOGERROR("TLS not supported on this platform");
+  return false;
+#endif
 }
 
 /*
@@ -90,13 +416,18 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
   db[in]          default database
 */
 
-void MySQL_Packet::send_authentication_packet(char *user, char *password, char *db)
+void MySQL_Packet::send_authentication_packet(char *user, char *password, char *db, uint32_t client_flags, uint8_t sequence_id)
 { 
   byte this_buffer[256];
   byte scramble[SHA256_HASH_SIZE];
 
   int size_send = 4;
-  uint32_t client_flags = 0x0003A60D | CLIENT_PLUGIN_AUTH;
+
+  if (client_flags == 0)
+  {
+    const bool use_tls = tls_established || ssl_request_sent || tls_requested;
+    client_flags = build_client_flags(use_tls);
+  }
 
   store_int(&this_buffer[size_send], client_flags, 4);
   size_send += 4;
@@ -180,13 +511,14 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   // Write packet size
   int p_size = size_send - 4;
   store_int(&this_buffer[0], p_size, 3);
-  this_buffer[3] = byte(0x01);
+  this_buffer[3] = sequence_id;
+
+  next_sequence_id = sequence_id + 1;
 
   // Write the packet
   ESP32_MYSQL_LOGINFO1("Writing authentication packet, size =", size_send);
 
-  client->write((uint8_t*)this_buffer, size_send);
-  client->flush();
+  write_bytes((uint8_t*)this_buffer, size_send);
 }
 
 /*
@@ -357,11 +689,9 @@ bool MySQL_Packet::read_packet()
     memset(buffer, 0, largest_buffer_size);
 
   // Read packet header
-  if (wait_for_bytes(PACKET_HEADER_SZ) < PACKET_HEADER_SZ)
+  if (!read_bytes(local, PACKET_HEADER_SZ))
   {
     packet_len = 0;
-    //////
-    
     ESP32_MYSQL_LOGINFO1("MySQL_Packet::read_packet: ", READ_TIMEOUT);
     
     return false;
@@ -370,9 +700,6 @@ bool MySQL_Packet::read_packet()
   ESP32_MYSQL_LOGLEVEL5("MySQL_Packet::read_packet: step 2");
 
   packet_len = 0;
-
-  for (int i = 0; i < PACKET_HEADER_SZ; i++)
-    local[i] = client->read();
 
   // Get packet length
   packet_len = local[0];
@@ -431,11 +758,16 @@ bool MySQL_Packet::read_packet()
     memset(buffer, 0, largest_buffer_size);
   }
 
-  for (int i = 0; i < PACKET_HEADER_SZ; i++)
-    buffer[i] = local[i];
+  memcpy(buffer, local, PACKET_HEADER_SZ);
 
-  for (int i = PACKET_HEADER_SZ; i < packet_len + PACKET_HEADER_SZ; i++)
-    buffer[i] = client->read();
+  if (packet_len > 0)
+  {
+    if (!read_bytes(buffer + PACKET_HEADER_SZ, packet_len))
+    {
+      ESP32_MYSQL_LOGERROR("MySQL_Packet::read_packet: failed reading payload");
+      return false;
+    }
+  }
 
   ESP32_MYSQL_LOGDEBUG("MySQL_Packet::read_packet: exit");
   

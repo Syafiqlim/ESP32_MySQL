@@ -36,6 +36,7 @@
 #define _ESP32_MYSQL_LOGLEVEL_      1
 
 #define USING_HOST_NAME     true
+#define USE_TLS             true
 
 #if USING_HOST_NAME
   // Optional using hostname
@@ -81,6 +82,14 @@ void setup()
 
   // print out info about the connection:
   ESP32_MYSQL_DISPLAY1("Connected to network. My IP address is:", WiFi.localIP());
+
+#if USE_TLS
+  #if USING_HOST_NAME
+    conn.enable_tls(true, server);   // Request TLS and pass hostname for SNI
+  #else
+    conn.enable_tls(true);
+  #endif
+#endif
 
   ESP32_MYSQL_DISPLAY3("Connecting to SQL Server @", server, ", Port =", server_port);
   ESP32_MYSQL_DISPLAY5("User =", user, ", PW =", password, ", DB =", default_database);

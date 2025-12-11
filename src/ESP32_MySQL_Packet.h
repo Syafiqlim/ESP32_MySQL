@@ -19,6 +19,12 @@
 
 #include <Arduino.h>
 #include <Client.h>
+#if defined(ESP32)
+  #include "mbedtls/ctr_drbg.h"
+  #include "mbedtls/entropy.h"
+  #include "mbedtls/ssl.h"
+  #include "mbedtls/net_sockets.h"
+#endif
 
 #define ESP32_MYSQL_OK_PACKET         0x00
 #define ESP32_MYSQL_EOF_PACKET        0xfe
@@ -66,14 +72,83 @@ class MySQL_Packet
 
 				free(server_version);
 			}
+      if (cached_password)
+      {
+        free(cached_password);
+        cached_password = NULL;
+      }
+
+      cleanup_tls();
     };
     
     bool    complete_handshake(char *user, char *password);
-    void    send_authentication_packet(char *user, char *password, char *db = NULL);
+    void    send_authentication_packet(char *user, char *password, char *db = NULL, uint32_t client_flags = 0, uint8_t sequence_id = 0x01);
     void    parse_handshake_packet();
     AuthPlugin get_auth_plugin() const
     {
       return auth_plugin_type;
+    }
+    void    reset_for_connect()
+    {
+      cache_password(NULL);
+      ssl_request_sent = false;
+      next_sequence_id = 0x01;
+      tls_established = false;
+      cleanup_tls();
+    }
+    void    enable_tls(bool enable = true, const char *sni_host = NULL)
+    {
+      tls_requested = enable;
+
+      if (sni_host)
+      {
+        strncpy(tls_sni_host, sni_host, sizeof(tls_sni_host) - 1);
+        tls_sni_host[sizeof(tls_sni_host) - 1] = 0;
+      }
+    }
+    bool    tls_active() const
+    {
+      return tls_established;
+    }
+    bool    wants_tls() const
+    {
+      return tls_requested;
+    }
+    bool    write_bytes(const uint8_t *data, size_t len);
+    bool    read_bytes(uint8_t *out, size_t len);
+    uint32_t build_client_flags(bool use_tls) const;
+    bool    send_ssl_request(uint32_t client_flags, uint8_t sequence_id = 0x01);
+    bool    start_tls_handshake();
+    uint8_t get_next_sequence_id() const
+    {
+      return next_sequence_id;
+    }
+    void    set_next_sequence_id(uint8_t seq)
+    {
+      next_sequence_id = seq;
+    }
+    void    cache_password(const char *password)
+    {
+      if (cached_password)
+      {
+        free(cached_password);
+        cached_password = NULL;
+      }
+
+      if (password)
+      {
+        size_t len = strlen(password);
+        cached_password = (char *) malloc(len + 1);
+
+        if (cached_password)
+        {
+          memcpy(cached_password, password, len + 1);
+        }
+      }
+    }
+    const char *get_cached_password() const
+    {
+      return cached_password;
     }
     bool    scramble_password(char *password, byte *pwd_hash);
 
@@ -91,9 +166,27 @@ class MySQL_Packet
 
   private:
     byte seed[20];
+    bool tls_requested = false;
+    bool tls_established = false;
+    char tls_sni_host[64] = { 0 };
+    bool ssl_request_sent = false;
+    uint8_t next_sequence_id = 0x01;
+    char *cached_password = NULL;
+    AuthPlugin plugin_from_name(const char *name) const;
+    bool cleanup_tls();
+    static int tls_send_cb(void *ctx, const unsigned char *buf, size_t len);
+    static int tls_recv_cb(void *ctx, unsigned char *buf, size_t len);
+    int blocking_read(unsigned char *buf, size_t len);
+    int blocking_read_tls(unsigned char *buf, size_t len);
+    int blocking_write_tls(const unsigned char *buf, size_t len);
+#if defined(ESP32)
+    mbedtls_ssl_context tls_ctx;
+    mbedtls_ssl_config tls_conf;
+    mbedtls_ctr_drbg_context tls_ctr_drbg;
+    mbedtls_entropy_context tls_entropy;
+#endif
     bool scramble_password_caching_sha2(char *password, byte *pwd_hash);
     bool scramble_password_sha256(char *password, byte *pwd_hash);
-    AuthPlugin plugin_from_name(const char *name) const;
 };
 
 

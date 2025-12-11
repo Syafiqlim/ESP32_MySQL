@@ -1,6 +1,6 @@
 /*
  * Minimal auth test against a user configured with caching_sha2_password.
- * Works on the fast-auth path (no TLS/RSA full-auth support).
+ * Uses TLS so both fast-auth and full-auth (password in TLS tunnel) work.
  */
 
 #include "Credentials.h"
@@ -11,6 +11,7 @@
 #include <ESP32_MySQL.h>
 
 #define USING_HOST_NAME true
+#define USE_TLS        true
 
 #if USING_HOST_NAME
   char server[] = "your-db-host.example.com";   // change to your server's hostname/URL
@@ -38,6 +39,14 @@ void setup()
   Serial.begin(115200);
   while (!Serial && millis() < 5000);
 
+#if USE_TLS
+  #if USING_HOST_NAME
+    conn.enable_tls(true, server);   // Request TLS and pass hostname for SNI
+  #else
+    conn.enable_tls(true);
+  #endif
+#endif
+
   Serial.println("\nAuth test (caching_sha2_password user)");
 
   WiFi.begin(ssid, pass);
@@ -64,7 +73,7 @@ void loop()
   }
   else
   {
-    Serial.println("Connect failed. If server asks for full auth, TLS/RSA is not implemented.");
+    Serial.println("Connect failed. Ensure TLS is enabled on the server or disable USE_TLS.");
   }
 
   delay(10000);
