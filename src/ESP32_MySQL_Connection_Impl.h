@@ -74,11 +74,6 @@ bool ESP32_MySQL_Connection::connect(const char *hostname, const uint16_t& port,
   if (wants_tls())
     enable_tls(true, hostname);
   cache_password(password);
-  cache_password(password);
-  if (wants_tls())
-    enable_tls(true, hostname);
-
-  reset_for_connect();
 
   // Retry up to MAX_CONNECT_ATTEMPTS times.
   while (retries++ < MAX_CONNECT_ATTEMPTS)
@@ -176,6 +171,11 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const char *hostnam
   
   if (db)
     ESP32_MYSQL_LOGWARN1("Using Database:", db);
+
+  reset_for_connect();
+  if (wants_tls())
+    enable_tls(true, hostname);
+  cache_password(password);
   
   while (retries < MAX_CONNECT_ATTEMPTS)
   {  
