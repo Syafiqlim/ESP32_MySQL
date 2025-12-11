@@ -10,7 +10,8 @@
 #include <ESP32_MySQL.h>
 
 #define USING_HOST_NAME true
-#define USE_TLS        true
+ //true pour TLS, false pour fallback RSA
+#define USE_TLS         true
 
 #if USING_HOST_NAME
   char server[] = "your-db-host.example.com";   // change to your server's hostname/URL

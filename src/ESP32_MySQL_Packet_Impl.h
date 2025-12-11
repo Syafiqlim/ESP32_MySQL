@@ -373,6 +373,99 @@ bool MySQL_Packet::start_tls_handshake()
 #endif
 }
 
+bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len, const char *password,
+                                        uint8_t *encrypted, size_t *encrypted_len)
+{
+#if defined(ESP32)
+  if (!pubkey || (pubkey_len == 0) || !password || !encrypted || !encrypted_len)
+    return false;
+
+  const size_t pw_len = strlen(password) + 1; // include terminating null
+
+  uint8_t *plain = (uint8_t *) malloc(pw_len);
+
+  if (!plain)
+    return false;
+
+  for (size_t i = 0; i < pw_len; i++)
+    plain[i] = ((uint8_t) password[i]) ^ seed[i % 20];
+
+  mbedtls_pk_context pk;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+
+  mbedtls_pk_init(&pk);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+
+  const char *pers = "esp32_mysql_rsa";
+  int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers, strlen(pers));
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("RSA seed failed, code =", ret);
+    goto cleanup;
+  }
+
+  ret = mbedtls_pk_parse_public_key(&pk, pubkey, pubkey_len);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("Parse RSA public key failed, code =", ret);
+    goto cleanup;
+  }
+
+  if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_RSA))
+  {
+    ESP32_MYSQL_LOGERROR("Public key is not RSA");
+    ret = -1;
+    goto cleanup;
+  }
+
+  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(pk);
+  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
+
+  size_t rsa_len = mbedtls_pk_get_len(&pk);
+
+  if (rsa_len == 0)
+  {
+    ESP32_MYSQL_LOGERROR("Invalid RSA modulus length");
+    ret = -1;
+    goto cleanup;
+  }
+
+  ret = mbedtls_pk_encrypt(&pk,
+                           plain,
+                           pw_len,
+                           encrypted,
+                           encrypted_len,
+                           rsa_len,
+                           mbedtls_ctr_drbg_random,
+                           &ctr_drbg);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("RSA encrypt failed, code =", ret);
+    goto cleanup;
+  }
+
+cleanup:
+  mbedtls_pk_free(&pk);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+  free(plain);
+
+  return ret == 0;
+#else
+  (void) pubkey;
+  (void) pubkey_len;
+  (void) password;
+  (void) encrypted;
+  (void) encrypted_len;
+  return false;
+#endif
+}
+
 /*
   send_authentication_packet
 

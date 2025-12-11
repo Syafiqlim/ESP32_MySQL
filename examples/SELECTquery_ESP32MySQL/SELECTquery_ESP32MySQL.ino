@@ -36,7 +36,8 @@
 #define _ESP32_MYSQL_LOGLEVEL_      1
 
 #define USING_HOST_NAME     true
-#define USE_TLS             true
+ //true pour TLS, false pour fallback RSA
+#define USE_TLS              true
 
 #if USING_HOST_NAME
   // Optional using hostname

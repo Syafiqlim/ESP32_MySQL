@@ -22,6 +22,9 @@
 #if defined(ESP32)
   #include "mbedtls/ctr_drbg.h"
   #include "mbedtls/entropy.h"
+  #include "mbedtls/md.h"
+  #include "mbedtls/pk.h"
+  #include "mbedtls/rsa.h"
   #include "mbedtls/ssl.h"
   #include "mbedtls/net_sockets.h"
 #endif
@@ -141,6 +144,8 @@ class MySQL_Packet
     {
       next_sequence_id = seq;
     }
+    bool    encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len, const char *password,
+                                 uint8_t *encrypted, size_t *encrypted_len);
     void    cache_password(const char *password)
     {
       if (cached_password)
