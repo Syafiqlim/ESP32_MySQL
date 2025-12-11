@@ -32,20 +32,6 @@
 #define ESP32_MYSQL_WAIT_INTERVAL 300    // WiFi client wait interval
 #define ESP32_MYSQL_TLS_TIMEOUT_MS 10000
 
-// Minimal subset of capability bits we need when crafting the handshake response
-#define CLIENT_LONG_PASSWORD                   0x00000001UL
-#define CLIENT_FOUND_ROWS                      0x00000002UL
-#define CLIENT_LONG_FLAG                       0x00000004UL
-#define CLIENT_CONNECT_WITH_DB                 0x00000008UL
-#define CLIENT_SSL                             0x00000800UL
-#define CLIENT_PROTOCOL_41                     0x00000200UL
-#define CLIENT_INTERACTIVE                     0x00000400UL
-#define CLIENT_TRANSACTIONS                    0x00002000UL
-#define CLIENT_SECURE_CONNECTION               0x00008000UL
-#define CLIENT_MULTI_STATEMENTS                0x00010000UL
-#define CLIENT_MULTI_RESULTS                   0x00020000UL
-#define CLIENT_PLUGIN_AUTH                     0x00080000UL
-
 /*
   Constructor
 
