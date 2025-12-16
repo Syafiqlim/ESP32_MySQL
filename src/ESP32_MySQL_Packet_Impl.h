@@ -20,6 +20,7 @@
 #include <Arduino.h>
 
 #include <ESP32_MySQL_Encrypt_Sha1.h>
+#include <ESP32_MySQL_Sha256.h>
 
 #if ( USING_WIFI_ESP_AT )
   #define ESP32_MYSQL_DATA_TIMEOUT  10000   
@@ -29,6 +30,7 @@
 //////
 
 #define ESP32_MYSQL_WAIT_INTERVAL 300    // WiFi client wait interval
+#define ESP32_MYSQL_TLS_TIMEOUT_MS 10000
 
 /*
   Constructor
@@ -40,6 +42,434 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
 	buffer = NULL;
 	server_version = NULL;
 	client = client_instance;
+	memset(auth_plugin, 0, sizeof(auth_plugin));
+	auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
+	auth_plugin_data_len = 0;
+	server_capabilities = 0;
+  memset(seed, 0, sizeof(seed));
+#if defined(ESP32)
+  mbedtls_ssl_init(&tls_ctx);
+  mbedtls_ssl_config_init(&tls_conf);
+  mbedtls_ctr_drbg_init(&tls_ctr_drbg);
+  mbedtls_entropy_init(&tls_entropy);
+#endif
+  memset(tls_sni_host, 0, sizeof(tls_sni_host));
+  tls_requested = false;
+  tls_established = false;
+  ssl_request_sent = false;
+  next_sequence_id = 0x01;
+}
+
+uint32_t MySQL_Packet::build_client_flags(bool use_tls) const
+{
+  uint32_t flags = 0x0003A60D | CLIENT_PLUGIN_AUTH;
+
+  if (use_tls)
+    flags |= CLIENT_SSL;
+
+  return flags;
+}
+
+bool MySQL_Packet::cleanup_tls()
+{
+#if defined(ESP32)
+  mbedtls_ssl_free(&tls_ctx);
+  mbedtls_ssl_config_free(&tls_conf);
+  mbedtls_ctr_drbg_free(&tls_ctr_drbg);
+  mbedtls_entropy_free(&tls_entropy);
+  tls_established = false;
+  return true;
+#else
+  return false;
+#endif
+}
+
+int MySQL_Packet::tls_send_cb(void *ctx, const unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  MySQL_Packet *self = static_cast<MySQL_Packet *>(ctx);
+
+  if (!self || !self->client)
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+
+  size_t written = self->client->write(buf, len);
+
+  return (written > 0) ? (int) written : MBEDTLS_ERR_NET_SEND_FAILED;
+#else
+  (void) ctx;
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::tls_recv_cb(void *ctx, unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  MySQL_Packet *self = static_cast<MySQL_Packet *>(ctx);
+
+  if (!self || !self->client)
+    return MBEDTLS_ERR_NET_RECV_FAILED;
+
+  unsigned long start = millis();
+
+  while ((self->client->available() == 0) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    delay(1);
+    yield();
+  }
+
+  if (self->client->available() == 0)
+    return MBEDTLS_ERR_SSL_TIMEOUT;
+
+  int received = self->client->read(buf, len);
+
+  if (received <= 0)
+    return MBEDTLS_ERR_NET_RECV_FAILED;
+
+  return received;
+#else
+  (void) ctx;
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::blocking_read(unsigned char *buf, size_t len)
+{
+  if (!client)
+    return -1;
+
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int avail = client->available();
+
+    if (avail > 0)
+    {
+      int read_now = client->read(buf + offset, len - offset);
+
+      if (read_now > 0)
+        offset += read_now;
+    }
+    else
+    {
+      delay(1);
+      yield();
+    }
+  }
+
+  return offset;
+}
+
+int MySQL_Packet::blocking_read_tls(unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int ret = mbedtls_ssl_read(&tls_ctx, buf + offset, len - offset);
+
+    if (ret > 0)
+    {
+      offset += ret;
+    }
+    else if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      delay(1);
+      yield();
+      continue;
+    }
+    else
+    {
+      return ret;
+    }
+  }
+
+  return offset;
+#else
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+int MySQL_Packet::blocking_write_tls(const unsigned char *buf, size_t len)
+{
+#if defined(ESP32)
+  size_t offset = 0;
+  unsigned long start = millis();
+
+  while ((offset < len) && ((millis() - start) < ESP32_MYSQL_DATA_TIMEOUT))
+  {
+    int ret = mbedtls_ssl_write(&tls_ctx, buf + offset, len - offset);
+
+    if (ret > 0)
+    {
+      offset += ret;
+    }
+    else if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      delay(1);
+      yield();
+      continue;
+    }
+    else
+    {
+      return ret;
+    }
+  }
+
+  return offset;
+#else
+  (void) buf;
+  (void) len;
+  return -1;
+#endif
+}
+
+bool MySQL_Packet::write_bytes(const uint8_t *data, size_t len)
+{
+  if (!client || (data == NULL))
+    return false;
+
+  if (tls_established)
+  {
+    int ret = blocking_write_tls(data, len);
+    return ret == (int) len;
+  }
+
+  size_t written = client->write(data, len);
+
+  return written == len;
+}
+
+bool MySQL_Packet::read_bytes(uint8_t *out, size_t len)
+{
+  if (!client || (out == NULL))
+    return false;
+
+  int ret = tls_established ? blocking_read_tls(out, len) : blocking_read(out, len);
+
+  return ret == (int) len;
+}
+
+bool MySQL_Packet::send_ssl_request(uint32_t client_flags, uint8_t sequence_id)
+{
+  // SSL Request packet: header (4 bytes) + payload (32 bytes)
+  uint8_t packet[4 + 32];
+  size_t offset = 0;
+
+  // Packet length (payload only)
+  store_int(packet, 32, 3);
+  packet[3] = sequence_id;
+  offset = 4;
+
+  store_int(&packet[offset], client_flags | CLIENT_SSL, 4);
+  offset += 4;
+
+  // max_allowed_packet (little endian). Keep minimal 1MB default style (0x01000000).
+  packet[offset + 0] = 0x00;
+  packet[offset + 1] = 0x00;
+  packet[offset + 2] = 0x00;
+  packet[offset + 3] = 0x01;
+  offset += 4;
+
+  // charset - default 8 (latin1)
+  packet[offset++] = byte(0x08);
+
+  // filler
+  for (int i = 0; i < 23; i++)
+    packet[offset + i] = 0x00;
+
+  offset += 23;
+
+  ssl_request_sent = write_bytes(packet, offset);
+
+  if (ssl_request_sent)
+    next_sequence_id = sequence_id + 1;
+
+  return ssl_request_sent;
+}
+
+bool MySQL_Packet::start_tls_handshake()
+{
+#if defined(ESP32)
+  cleanup_tls();
+
+  mbedtls_ssl_init(&tls_ctx);
+  mbedtls_ssl_config_init(&tls_conf);
+  mbedtls_ctr_drbg_init(&tls_ctr_drbg);
+  mbedtls_entropy_init(&tls_entropy);
+
+  const char *pers = "esp32_mysql_tls";
+  int ret = mbedtls_ctr_drbg_seed(&tls_ctr_drbg, mbedtls_entropy_func, &tls_entropy, (const unsigned char *) pers, strlen(pers));
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS seed failed, code =", ret);
+    return false;
+  }
+
+  ret = mbedtls_ssl_config_defaults(&tls_conf,
+                                    MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS config defaults failed, code =", ret);
+    return false;
+  }
+
+  mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_rng(&tls_conf, mbedtls_ctr_drbg_random, &tls_ctr_drbg);
+
+  ret = mbedtls_ssl_setup(&tls_ctx, &tls_conf);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("TLS setup failed, code =", ret);
+    return false;
+  }
+
+  if (tls_sni_host[0] != 0)
+    mbedtls_ssl_set_hostname(&tls_ctx, tls_sni_host);
+
+  mbedtls_ssl_set_bio(&tls_ctx, this, tls_send_cb, tls_recv_cb, NULL);
+
+  unsigned long start = millis();
+
+  while ((ret = mbedtls_ssl_handshake(&tls_ctx)) != 0)
+  {
+    if ((ret != MBEDTLS_ERR_SSL_WANT_READ) && (ret != MBEDTLS_ERR_SSL_WANT_WRITE))
+    {
+      ESP32_MYSQL_LOGERROR1("TLS handshake failed, code =", ret);
+      cleanup_tls();
+      return false;
+    }
+
+    if ((millis() - start) > ESP32_MYSQL_TLS_TIMEOUT_MS)
+    {
+      ESP32_MYSQL_LOGERROR("TLS handshake timeout");
+      cleanup_tls();
+      return false;
+    }
+
+    delay(1);
+    yield();
+  }
+
+  tls_established = true;
+  return true;
+#else
+  ESP32_MYSQL_LOGERROR("TLS not supported on this platform");
+  return false;
+#endif
+}
+
+bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len, const char *password,
+                                        uint8_t *encrypted, size_t *encrypted_len)
+{
+#if defined(ESP32)
+  if (!pubkey || (pubkey_len == 0) || !password || !encrypted || !encrypted_len)
+    return false;
+
+  const size_t pw_len = strlen(password) + 1; // include terminating null
+
+  uint8_t *plain = (uint8_t *) malloc(pw_len);
+
+  if (!plain)
+    return false;
+
+  for (size_t i = 0; i < pw_len; i++)
+    plain[i] = ((uint8_t) password[i]) ^ seed[i % 20];
+
+  bool ok = false;
+  int ret = 0;
+  size_t rsa_len = 0;
+  mbedtls_rsa_context *rsa = NULL;
+
+  mbedtls_pk_context pk;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_context entropy;
+
+  mbedtls_pk_init(&pk);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  mbedtls_entropy_init(&entropy);
+
+  const char *pers = "esp32_mysql_rsa";
+  ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers, strlen(pers));
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("RSA seed failed, code =", ret);
+    goto cleanup_labels;
+  }
+
+  ret = mbedtls_pk_parse_public_key(&pk, pubkey, pubkey_len);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("Parse RSA public key failed, code =", ret);
+    goto cleanup_labels;
+  }
+
+  if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_RSA))
+  {
+    ESP32_MYSQL_LOGERROR("Public key is not RSA");
+    ret = -1;
+    goto cleanup_labels;
+  }
+
+  rsa = mbedtls_pk_rsa(pk);
+  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
+
+  rsa_len = mbedtls_pk_get_len(&pk);
+
+  if (rsa_len == 0)
+  {
+    ESP32_MYSQL_LOGERROR("Invalid RSA modulus length");
+    ret = -1;
+    goto cleanup_labels;
+  }
+
+  ret = mbedtls_pk_encrypt(&pk,
+                           plain,
+                           pw_len,
+                           encrypted,
+                           encrypted_len,
+                           rsa_len,
+                           mbedtls_ctr_drbg_random,
+                           &ctr_drbg);
+
+  if (ret != 0)
+  {
+    ESP32_MYSQL_LOGERROR1("RSA encrypt failed, code =", ret);
+    goto cleanup_labels;
+  }
+  ok = true;
+
+cleanup_labels:
+  mbedtls_pk_free(&pk);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+  free(plain);
+
+  return ok && (ret == 0);
+#else
+  (void) pubkey;
+  (void) pubkey_len;
+  (void) password;
+  (void) encrypted;
+  (void) encrypted_len;
+  return false;
+#endif
 }
 
 /*
@@ -71,18 +501,20 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
   db[in]          default database
 */
 
-void MySQL_Packet::send_authentication_packet(char *user, char *password, char *db)
+void MySQL_Packet::send_authentication_packet(char *user, char *password, char *db, uint32_t client_flags, uint8_t sequence_id)
 { 
   byte this_buffer[256];
-  byte scramble[20];
+  byte scramble[SHA256_HASH_SIZE];
 
   int size_send = 4;
 
-  // client flags
-  this_buffer[size_send] = byte(0x0D);
-  this_buffer[size_send + 1] = byte(0xa6);
-  this_buffer[size_send + 2] = byte(0x03);
-  this_buffer[size_send + 3] = byte(0x00);
+  if (client_flags == 0)
+  {
+    const bool use_tls = tls_established || ssl_request_sent || tls_requested;
+    client_flags = build_client_flags(use_tls);
+  }
+
+  store_int(&this_buffer[size_send], client_flags, 4);
   size_send += 4;
 
   // max_allowed_packet
@@ -96,7 +528,7 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   this_buffer[size_send] = byte(0x08);
   size_send += 1;
 
-  for (int i = 0; i < 24; i++)
+  for (int i = 0; i < 23; i++)
     this_buffer[size_send + i] = 0x00;
 
   size_send += 23;
@@ -105,41 +537,73 @@ void MySQL_Packet::send_authentication_packet(char *user, char *password, char *
   memcpy((char *) &this_buffer[size_send], user, strlen(user));
   size_send += strlen(user) + 1;
   this_buffer[size_send - 1] = 0x00;
-   
-  if (scramble_password(password, scramble)) 
+
+  AuthPlugin plugin = (auth_plugin_type == AUTH_UNKNOWN) ? AUTH_MYSQL_NATIVE_PASSWORD : auth_plugin_type;
+  bool has_scramble = false;
+  uint8_t scramble_len = 0;
+
+  if (plugin == AUTH_CACHING_SHA2_PASSWORD)
   {
-    this_buffer[size_send] = 0x14;
-    size_send += 1;
-    
-    for (int i = 0; i < 20; i++)
-      this_buffer[i + size_send] = scramble[i];
-      
-    size_send += 20;
-    this_buffer[size_send] = 0x00;
+    has_scramble = scramble_password_caching_sha2(password, scramble);
+    scramble_len = SHA256_HASH_SIZE;
   }
-  
-  if (db) 
+  else if (plugin == AUTH_SHA256_PASSWORD)
   {
-    memcpy((char *)&this_buffer[size_send], db, strlen(db));
+    has_scramble = scramble_password_sha256(password, scramble);
+    scramble_len = SHA256_HASH_SIZE;
+  }
+  else
+  {
+    has_scramble = scramble_password(password, scramble);
+    scramble_len = 20;
+  }
+
+  if (has_scramble)
+  {
+    this_buffer[size_send] = scramble_len;
+    size_send += 1;
+
+    for (uint8_t i = 0; i < scramble_len; i++)
+      this_buffer[i + size_send] = scramble[i];
+
+    size_send += scramble_len;
+  }
+  else
+  {
+    this_buffer[size_send] = 0x00;
+    size_send += 1;
+  }
+
+  if (db)
+  {
+    memcpy((char *) &this_buffer[size_send], db, strlen(db));
     size_send += strlen(db) + 1;
     this_buffer[size_send - 1] = 0x00;
-  } 
-  else 
+  }
+  else
   {
-    this_buffer[size_send + 1] = 0x00;
+    this_buffer[size_send] = 0x00;
     size_send += 1;
   }
+
+  // Authentication plugin name (makes the server honor our scramble choice)
+  const char *plugin_name = (auth_plugin[0] != 0) ? auth_plugin : "mysql_native_password";
+  const size_t plugin_len = strlen(plugin_name);
+
+  memcpy(&this_buffer[size_send], plugin_name, plugin_len + 1);
+  size_send += plugin_len + 1;
 
   // Write packet size
   int p_size = size_send - 4;
   store_int(&this_buffer[0], p_size, 3);
-  this_buffer[3] = byte(0x01);
+  this_buffer[3] = sequence_id;
+
+  next_sequence_id = sequence_id + 1;
 
   // Write the packet
-  ESP32_MYSQL_LOGINFO1("Writing this_buffer, size_send =", size_send);
-  
-  client->write((uint8_t*)this_buffer, size_send);
-  client->flush();
+  ESP32_MYSQL_LOGINFO1("Writing authentication packet, size =", size_send);
+
+  write_bytes((uint8_t*)this_buffer, size_send);
 }
 
 /*
@@ -191,6 +655,40 @@ bool MySQL_Packet::scramble_password(char *password, byte *pwd_hash)
     pwd_hash[i] = hash1[i] ^ hash3[i];
 
   return true;
+}
+
+bool MySQL_Packet::scramble_password_caching_sha2(char *password, byte *pwd_hash)
+{
+  if (!password || (strlen(password) == 0))
+    return false;
+
+  uint8_t hash1[SHA256_HASH_SIZE];
+  uint8_t hash2[SHA256_HASH_SIZE];
+  uint8_t hash3[SHA256_HASH_SIZE];
+
+  ESP32_MySQL_SHA256 sha256;
+  sha256.update((uint8_t *) password, strlen(password));
+  sha256.final(hash1);
+
+  ESP32_MySQL_SHA256 sha256_second;
+  sha256_second.update(hash1, SHA256_HASH_SIZE);
+  sha256_second.final(hash2);
+
+  ESP32_MySQL_SHA256 sha256_third;
+  sha256_third.update(hash2, SHA256_HASH_SIZE);
+  sha256_third.update(seed, 20);
+  sha256_third.final(hash3);
+
+  for (int i = 0; i < SHA256_HASH_SIZE; i++)
+    pwd_hash[i] = hash1[i] ^ hash3[i];
+
+  return true;
+}
+
+bool MySQL_Packet::scramble_password_sha256(char *password, byte *pwd_hash)
+{
+  // sha256_password requires the same scramble as caching_sha2_password for the fast auth path.
+  return scramble_password_caching_sha2(password, pwd_hash);
 }
 
 /*
@@ -276,11 +774,9 @@ bool MySQL_Packet::read_packet()
     memset(buffer, 0, largest_buffer_size);
 
   // Read packet header
-  if (wait_for_bytes(PACKET_HEADER_SZ) < PACKET_HEADER_SZ)
+  if (!read_bytes(local, PACKET_HEADER_SZ))
   {
     packet_len = 0;
-    //////
-    
     ESP32_MYSQL_LOGINFO1("MySQL_Packet::read_packet: ", READ_TIMEOUT);
     
     return false;
@@ -289,9 +785,6 @@ bool MySQL_Packet::read_packet()
   ESP32_MYSQL_LOGLEVEL5("MySQL_Packet::read_packet: step 2");
 
   packet_len = 0;
-
-  for (int i = 0; i < PACKET_HEADER_SZ; i++)
-    local[i] = client->read();
 
   // Get packet length
   packet_len = local[0];
@@ -350,11 +843,16 @@ bool MySQL_Packet::read_packet()
     memset(buffer, 0, largest_buffer_size);
   }
 
-  for (int i = 0; i < PACKET_HEADER_SZ; i++)
-    buffer[i] = local[i];
+  memcpy(buffer, local, PACKET_HEADER_SZ);
 
-  for (int i = PACKET_HEADER_SZ; i < packet_len + PACKET_HEADER_SZ; i++)
-    buffer[i] = client->read();
+  if (packet_len > 0)
+  {
+    if (!read_bytes(buffer + PACKET_HEADER_SZ, packet_len))
+    {
+      ESP32_MYSQL_LOGERROR("MySQL_Packet::read_packet: failed reading payload");
+      return false;
+    }
+  }
 
   ESP32_MYSQL_LOGDEBUG("MySQL_Packet::read_packet: exit");
   
@@ -395,39 +893,129 @@ void MySQL_Packet::parse_handshake_packet()
     return;
   }
 
-  int i = 5;
+  // Reset state from any previous handshake
+  memset(seed, 0, sizeof(seed));
+  memset(auth_plugin, 0, sizeof(auth_plugin));
+  auth_plugin_type = AUTH_MYSQL_NATIVE_PASSWORD;
+  auth_plugin_data_len = 0;
+  server_capabilities = 0;
 
-  do
-  {
-    i++;
-  } while (buffer[i - 1] != 0x00);
+  // Payload starts after the 4-byte packet header
+  size_t offset = 4;
+  const size_t end = packet_len + 4;
 
-  if (i > 5)
+  if (offset >= end)
+    return;
+
+  // Skip protocol version
+  offset++;
+
+  // Read server version string (null-terminated)
+  size_t version_start = offset;
+
+  while ((offset < end) && (buffer[offset] != 0x00))
+    offset++;
+
+  if (offset > version_start)
   {
-    server_version = (char *) malloc(i - 5);
+    size_t ver_len = offset - version_start;
 
     if (server_version)
     {
-      strncpy(server_version, (char *) &buffer[5], i - 5);
-      server_version[i - 5 - 1] = 0;
+      free(server_version);
+      server_version = NULL;
+    }
+
+    server_version = (char *) malloc(ver_len + 1);
+
+    if (server_version)
+    {
+      memcpy(server_version, &buffer[version_start], ver_len);
+      server_version[ver_len] = 0;
     }
   }
 
-  // Capture the first 8 characters of seed
-  i += 4; // Skip thread id
+  // Skip the null terminator
+  offset++;
 
-  for (int j = 0; j < 8; j++)
+  if (offset + 4 > end)
+    return;
+
+  // Thread id
+  offset += 4;
+
+  // Scramble part 1 (8 bytes)
+  for (int j = 0; (j < 8) && (offset + j < end); j++)
   {
-    seed[j] = buffer[i + j];
+    seed[j] = buffer[offset + j];
   }
 
-  // Capture rest of seed
-  i += 27; // skip ahead
+  offset += 8;
 
-  for (int j = 0; j < 12; j++)
+  // Filler
+  offset++;
+
+  if (offset + 2 > end)
+    return;
+
+  server_capabilities = buffer[offset] | (buffer[offset + 1] << 8);
+  offset += 2;
+
+  // Charset
+  offset++;
+
+  // Status flags
+  offset += 2;
+
+  if (offset + 2 > end)
+    return;
+
+  server_capabilities |= ((uint32_t) (buffer[offset] | (buffer[offset + 1] << 8))) << 16;
+  offset += 2;
+
+  if (offset < end)
   {
-    seed[j + 8] = buffer[i + j];
+    auth_plugin_data_len = buffer[offset];
+    offset++;
   }
+
+  // Reserved bytes
+  offset += 10;
+
+  size_t second_seed_len = (auth_plugin_data_len > 0) ? max((int) auth_plugin_data_len - 8, 12) : 12;
+  const size_t available_seed_bytes = (offset < end) ? min(second_seed_len, end - offset) : 0;
+
+  for (size_t j = 0; (j < 12) && (j < available_seed_bytes); j++)
+  {
+    seed[j + 8] = buffer[offset + j];
+  }
+
+  offset += available_seed_bytes;
+
+  if (offset < end)
+  {
+    size_t plugin_start = offset;
+
+    while ((offset < end) && (buffer[offset] != 0x00))
+      offset++;
+
+    size_t plugin_len = (offset > plugin_start) ? min((size_t) (sizeof(auth_plugin) - 1), offset - plugin_start) : 0;
+
+    if (plugin_len > 0)
+    {
+      memcpy(auth_plugin, &buffer[plugin_start], plugin_len);
+      auth_plugin[plugin_len] = 0;
+    }
+  }
+
+  if (auth_plugin[0] == 0)
+  {
+    strncpy(auth_plugin, "mysql_native_password", sizeof(auth_plugin) - 1);
+    auth_plugin[sizeof(auth_plugin) - 1] = 0;
+  }
+
+  auth_plugin_type = plugin_from_name(auth_plugin);
+  ESP32_MYSQL_LOGINFO1("Auth plugin from server:", auth_plugin);
 }
 
 /*
@@ -465,6 +1053,23 @@ void MySQL_Packet::parse_error_packet()
   }
     
   ESP32_MYSQL_LOGDEBUG0LN(".");
+}
+
+AuthPlugin MySQL_Packet::plugin_from_name(const char *name) const
+{
+  if (!name || (strlen(name) == 0))
+    return AUTH_UNKNOWN;
+
+  if (strcmp(name, "mysql_native_password") == 0)
+    return AUTH_MYSQL_NATIVE_PASSWORD;
+
+  if (strcmp(name, "caching_sha2_password") == 0)
+    return AUTH_CACHING_SHA2_PASSWORD;
+
+  if (strcmp(name, "sha256_password") == 0)
+    return AUTH_SHA256_PASSWORD;
+
+  return AUTH_UNKNOWN;
 }
 
 

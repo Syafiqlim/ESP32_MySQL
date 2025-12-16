@@ -70,6 +70,11 @@ bool ESP32_MySQL_Connection::connect(const char *hostname, const uint16_t& port,
   if (db)
     ESP32_MYSQL_LOGWARN1("Using Database:", db);
 
+  reset_for_connect();
+  if (wants_tls())
+    enable_tls(true, hostname);
+  cache_password(password);
+
   // Retry up to MAX_CONNECT_ATTEMPTS times.
   while (retries++ < MAX_CONNECT_ATTEMPTS)
   {
@@ -105,20 +110,41 @@ bool ESP32_MySQL_Connection::connect(const char *hostname, const uint16_t& port,
 
   ESP32_MYSQL_LOGINFO("Try send_authentication packets");
 
-  send_authentication_packet(user, password, db);
+  const bool tls_possible = wants_tls() && (server_capabilities & CLIENT_SSL);
+  uint32_t client_flags = build_client_flags(tls_possible);
+  uint8_t auth_sequence_id = 0x01;
+
+  if (tls_possible)
+  {
+    if (!send_ssl_request(client_flags, auth_sequence_id))
+    {
+      ESP32_MYSQL_LOGERROR("Failed to send SSL Request packet");
+      return false;
+    }
+
+    auth_sequence_id = get_next_sequence_id();
+
+    if (!start_tls_handshake())
+    {
+      ESP32_MYSQL_LOGERROR("TLS handshake failed");
+      return false;
+    }
+  }
+  else if (wants_tls() && !tls_possible)
+  {
+    ESP32_MYSQL_LOGWARN("Server does not advertise SSL support, continuing without TLS");
+  }
+
+  send_authentication_packet(user, password, db, client_flags, auth_sequence_id);
    
   if ( !read_packet() )
   {
     ESP32_MYSQL_LOGERROR("Can't connect. Error reading auth packets");
   }
-	else if (get_packet_type() != ESP32_MYSQL_OK_PACKET)
+  else if (handle_authentication_result())
   {
-    parse_error_packet();
-  }
-  else
-  {
-  	ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
-  	returnVal = true;
+    ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
+    returnVal = true;
   }
 
 	if (server_version)
@@ -145,6 +171,11 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const char *hostnam
   
   if (db)
     ESP32_MYSQL_LOGWARN1("Using Database:", db);
+
+  reset_for_connect();
+  if (wants_tls())
+    enable_tls(true, hostname);
+  cache_password(password);
   
   while (retries < MAX_CONNECT_ATTEMPTS)
   {  
@@ -191,20 +222,41 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const char *hostnam
 
   ESP32_MYSQL_LOGINFO("Try send_authentication packets");
 
-  send_authentication_packet(user, password, db);
+  const bool tls_possible = wants_tls() && (server_capabilities & CLIENT_SSL);
+  uint32_t client_flags = build_client_flags(tls_possible);
+  uint8_t auth_sequence_id = 0x01;
+
+  if (tls_possible)
+  {
+    if (!send_ssl_request(client_flags, auth_sequence_id))
+    {
+      ESP32_MYSQL_LOGERROR("Failed to send SSL Request packet");
+      return RESULT_FAIL;
+    }
+
+    auth_sequence_id = get_next_sequence_id();
+
+    if (!start_tls_handshake())
+    {
+      ESP32_MYSQL_LOGERROR("TLS handshake failed");
+      return RESULT_FAIL;
+    }
+  }
+  else if (wants_tls() && !tls_possible)
+  {
+    ESP32_MYSQL_LOGWARN("Server does not advertise SSL support, continuing without TLS");
+  }
+
+  send_authentication_packet(user, password, db, client_flags, auth_sequence_id);
    
   if ( !read_packet() )
   {
     ESP32_MYSQL_LOGERROR("Can't connect. Error reading auth packets");
   }
-	else if (get_packet_type() != ESP32_MYSQL_OK_PACKET)
+  else if (handle_authentication_result())
   {
-    parse_error_packet();
-  }
-  else
-  {
-  	ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
-  	returnVal = RESULT_OK;
+    ESP32_MYSQL_LOGWARN1("Connected. Server Version =", server_version);
+    returnVal = RESULT_OK;
   }
 
 	if (server_version)
@@ -232,6 +284,182 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const IPAddress& se
 
 //////////////////////////////////////////////////////////////
 
+bool ESP32_MySQL_Connection::handle_authentication_result()
+{
+  const int type = get_packet_type();
+
+  if (type == ESP32_MYSQL_OK_PACKET)
+    return true;
+
+  if (type == ESP32_MYSQL_ERROR_PACKET)
+  {
+    parse_error_packet();
+    return false;
+  }
+
+  if ((auth_plugin_type == AUTH_CACHING_SHA2_PASSWORD) && buffer && (packet_len >= 2))
+  {
+    // caching_sha2_password returns small packets with auth stage markers
+    if (buffer[4] == 0x01)
+    {
+      const uint8_t auth_step = buffer[5];
+
+      if (auth_step == 0x03)
+      {
+        ESP32_MYSQL_LOGINFO("caching_sha2 fast auth accepted, waiting for final OK");
+
+        if (!read_packet())
+        {
+          ESP32_MYSQL_LOGERROR("Failed reading final OK packet after fast auth");
+          return false;
+        }
+
+        if (get_packet_type() == ESP32_MYSQL_OK_PACKET)
+          return true;
+
+        parse_error_packet();
+        return false;
+      }
+      else if (auth_step == 0x04)
+      {
+        const char *pwd = get_cached_password();
+
+        if (!pwd)
+        {
+          ESP32_MYSQL_LOGERROR("No cached password available for full authentication");
+          return false;
+        }
+
+        if (tls_active())
+        {
+          const size_t pwd_len = strlen(pwd);
+          const size_t payload_len = pwd_len + 1; // null-terminated password
+          const size_t packet_len = payload_len + 4;
+          uint8_t *packet = (uint8_t *) malloc(packet_len);
+
+          if (!packet)
+          {
+            ESP32_MYSQL_LOGERROR("Failed to allocate packet for full authentication");
+            return false;
+          }
+
+          const uint8_t response_seq = buffer ? (uint8_t) (buffer[3] + 1) : get_next_sequence_id();
+
+          store_int(packet, payload_len, 3);
+          packet[3] = response_seq;
+          memcpy(packet + 4, pwd, pwd_len);
+          packet[4 + pwd_len] = 0x00;
+
+          bool wrote = write_bytes(packet, packet_len);
+          set_next_sequence_id(response_seq + 1);
+          free(packet);
+
+          if (!wrote)
+          {
+            ESP32_MYSQL_LOGERROR("Failed to send full authentication response over TLS");
+            return false;
+          }
+
+          if (!read_packet())
+          {
+            ESP32_MYSQL_LOGERROR("Failed reading final OK packet after full auth");
+            return false;
+          }
+
+          if (get_packet_type() == ESP32_MYSQL_OK_PACKET)
+            return true;
+
+          parse_error_packet();
+          return false;
+        }
+        else
+        {
+          // Fallback RSA path (no TLS available)
+          const uint8_t request_seq = buffer ? (uint8_t) (buffer[3] + 1) : get_next_sequence_id();
+          uint8_t request[5];
+          store_int(request, 1, 3);
+          request[3] = request_seq;
+          request[4] = 0x02; // request public key
+
+          if (!write_bytes(request, sizeof(request)))
+          {
+            ESP32_MYSQL_LOGERROR("Failed to request RSA public key");
+            return false;
+          }
+
+          set_next_sequence_id(request_seq + 1);
+
+          if (!read_packet())
+          {
+            ESP32_MYSQL_LOGERROR("Failed reading RSA public key packet");
+            return false;
+          }
+
+          if ((packet_len <= 0) || !buffer || (packet_len > MAX_TRANSMISSION_UNIT))
+          {
+            ESP32_MYSQL_LOGERROR("Invalid RSA public key packet");
+            return false;
+          }
+
+          const uint8_t *pubkey = buffer + 4;
+          size_t pubkey_len = packet_len;
+
+          uint8_t encrypted[512];
+          size_t encrypted_len = sizeof(encrypted);
+
+          if (!encrypt_password_rsa(pubkey, pubkey_len, pwd, encrypted, &encrypted_len))
+          {
+            ESP32_MYSQL_LOGERROR("RSA encryption failed");
+            return false;
+          }
+
+          const uint8_t response_seq = buffer ? (uint8_t) (buffer[3] + 1) : get_next_sequence_id();
+          const size_t payload_len = encrypted_len;
+          const size_t packet_len_out = payload_len + 4;
+          uint8_t *packet = (uint8_t *) malloc(packet_len_out);
+
+          if (!packet)
+          {
+            ESP32_MYSQL_LOGERROR("Failed to allocate RSA auth packet");
+            return false;
+          }
+
+          store_int(packet, payload_len, 3);
+          packet[3] = response_seq;
+          memcpy(packet + 4, encrypted, encrypted_len);
+
+          bool wrote = write_bytes(packet, packet_len_out);
+          set_next_sequence_id(response_seq + 1);
+          free(packet);
+
+          if (!wrote)
+          {
+            ESP32_MYSQL_LOGERROR("Failed to send RSA full authentication response");
+            return false;
+          }
+
+          if (!read_packet())
+          {
+            ESP32_MYSQL_LOGERROR("Failed reading final OK packet after RSA full auth");
+            return false;
+          }
+
+          if (get_packet_type() == ESP32_MYSQL_OK_PACKET)
+            return true;
+
+          parse_error_packet();
+          return false;
+        }
+      }
+    }
+  }
+
+  ESP32_MYSQL_LOGERROR1("Unexpected auth response, packet type =", type);
+  return false;
+}
+
+//////////////////////////////////////////////////////////////
+
 /*
   close - cancel the connection
 
@@ -245,6 +473,7 @@ void ESP32_MySQL_Connection::close()
     client->flush();
     client->stop();
     
+    reset_for_connect();
     ESP32_MYSQL_LOGERROR("Disconnected");
   }
 }

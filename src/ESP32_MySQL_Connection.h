@@ -59,6 +59,9 @@ class ESP32_MySQL_Connection : public MySQL_Packet
     }
     
     void close();
+
+  private:
+    bool handle_authentication_result();
 };
 
 //#include <MySQL_Generic_Connection_Impl.h>

@@ -182,8 +182,8 @@ bool ESP32_MySQL_Query::execute_query(const int& query_len)
   // Send the query
   ESP32_MYSQL_LOGDEBUG1("ESP32_MySQL_Query::execute_query: query = ", (char *) &conn->buffer[COMMAND_HEADER_LEN] );
   
-  conn->client->write((uint8_t*)conn->buffer, query_len + COMMAND_HEADER_LEN);
-  conn->client->flush();
+  if (!conn->write_bytes((uint8_t*)conn->buffer, query_len + COMMAND_HEADER_LEN))
+    return false;
 
   // Read a response packet and check it for Ok or Error.
   if ( !conn->read_packet() || ( conn->packet_len <= 0 ) || ( conn->packet_len > MAX_TRANSMISSION_UNIT ) )
