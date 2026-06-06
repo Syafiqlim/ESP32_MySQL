@@ -284,9 +284,34 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const IPAddress& se
 
 //////////////////////////////////////////////////////////////
 
-bool ESP32_MySQL_Connection::handle_authentication_result()
+bool ESP32_MySQL_Connection::handle_authentication_result(int depth)
 {
+  // Prevent unbounded recursion from malicious/misconfigured servers
+  if (depth >= MAX_AUTH_SWITCH_DEPTH)
+  {
+    ESP32_MYSQL_LOGERROR("handle_authentication_result: Max auth switch depth exceeded");
+    return false;
+  }
+
   const int type = get_packet_type();
+
+  // During authentication, packet marker 0xFE can be an AuthSwitchRequest.
+  if ((type == ESP32_MYSQL_EOF_PACKET) && buffer && (packet_len > 1) && (buffer[4] == 0xFE))
+  {
+    if (!handle_auth_switch_request())
+      return false;
+
+    if (!send_auth_switch_response())
+      return false;
+
+    if (!read_packet())
+    {
+      ESP32_MYSQL_LOGERROR("Failed reading server packet after AuthSwitchResponse");
+      return false;
+    }
+
+    return handle_authentication_result();
+  }
 
   if (type == ESP32_MYSQL_OK_PACKET)
     return true;
@@ -295,6 +320,45 @@ bool ESP32_MySQL_Connection::handle_authentication_result()
   {
     parse_error_packet();
     return false;
+  }
+
+  // Handle AuthSwitchRequest (0xFE packet with plugin name)
+  // This happens when the server's default auth plugin differs from the user's auth plugin
+  if (type == ESP32_MYSQL_AUTH_SWITCH && buffer && packet_len >= 1)
+  {
+    // Check for Old Auth Switch Request (packet_len == 1, just 0xFE)
+    // This is for very old mysql_old_password which is deprecated and insecure
+    if (packet_len == 1)
+    {
+      ESP32_MYSQL_LOGERROR("Old Auth Switch Request received (mysql_old_password) - not supported");
+      ESP32_MYSQL_LOGERROR("Please upgrade user to mysql_native_password or caching_sha2_password");
+      return false;
+    }
+    
+    // AuthSwitchRequest format:
+    // 1 byte: status (0xFE)
+    // string[NUL]: plugin name
+    // string[EOF]: plugin provided data (new scramble)
+    
+    char *password = (char *)get_cached_password();
+    
+    if (handle_auth_switch_request(password))
+    {
+      // Read the response after sending auth switch response
+      if (!read_packet())
+      {
+        ESP32_MYSQL_LOGERROR("Failed reading packet after auth switch response");
+        return false;
+      }
+      
+      // Recursively handle the result (could be OK, error, or further auth steps)
+      return handle_authentication_result(depth + 1);
+    }
+    else
+    {
+      ESP32_MYSQL_LOGERROR("Failed to handle auth switch request");
+      return false;
+    }
   }
 
   if ((auth_plugin_type == AUTH_CACHING_SHA2_PASSWORD) && buffer && (packet_len >= 2))

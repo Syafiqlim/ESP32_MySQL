@@ -61,7 +61,8 @@ class ESP32_MySQL_Connection : public MySQL_Packet
     void close();
 
   private:
-    bool handle_authentication_result();
+    static const int MAX_AUTH_SWITCH_DEPTH = 5;
+    bool handle_authentication_result(int depth = 0);
 };
 
 //#include <MySQL_Generic_Connection_Impl.h>
