@@ -52,8 +52,11 @@ MySQL_Packet::MySQL_Packet(Client *client_instance)
   mbedtls_ssl_config_init(&tls_conf);
   mbedtls_ctr_drbg_init(&tls_ctr_drbg);
   mbedtls_entropy_init(&tls_entropy);
+  mbedtls_x509_crt_init(&tls_ca);
 #endif
   memset(tls_sni_host, 0, sizeof(tls_sni_host));
+  tls_ca_pem = NULL;
+  tls_verify_hostname = true;
   tls_requested = false;
   tls_established = false;
   ssl_request_sent = false;
@@ -77,6 +80,7 @@ bool MySQL_Packet::cleanup_tls()
   mbedtls_ssl_config_free(&tls_conf);
   mbedtls_ctr_drbg_free(&tls_ctr_drbg);
   mbedtls_entropy_free(&tls_entropy);
+  mbedtls_x509_crt_free(&tls_ca);
   tls_established = false;
   return true;
 #else
@@ -306,6 +310,7 @@ bool MySQL_Packet::start_tls_handshake()
   mbedtls_ssl_config_init(&tls_conf);
   mbedtls_ctr_drbg_init(&tls_ctr_drbg);
   mbedtls_entropy_init(&tls_entropy);
+  mbedtls_x509_crt_init(&tls_ca);
 
   const char *pers = "esp32_mysql_tls";
   int ret = mbedtls_ctr_drbg_seed(&tls_ctr_drbg, mbedtls_entropy_func, &tls_entropy, (const unsigned char *) pers, strlen(pers));
@@ -327,7 +332,29 @@ bool MySQL_Packet::start_tls_handshake()
     return false;
   }
 
-  mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_NONE);
+  if (tls_ca_pem)
+  {
+    // PEM parsing needs the terminating null byte in the length
+    ret = mbedtls_x509_crt_parse(&tls_ca, (const unsigned char *) tls_ca_pem, strlen(tls_ca_pem) + 1);
+
+    if (ret < 0)
+    {
+      ESP32_MYSQL_LOGERROR1("TLS CA certificate parse failed, code =", ret);
+      return false;
+    }
+
+    if (ret > 0)
+      ESP32_MYSQL_LOGWARN1("TLS CA certificates skipped (unparsable) =", ret);
+
+    mbedtls_ssl_conf_ca_chain(&tls_conf, &tls_ca, NULL);
+    mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+  }
+  else
+  {
+    ESP32_MYSQL_LOGWARN("No CA certificate set: server certificate is NOT verified");
+    mbedtls_ssl_conf_authmode(&tls_conf, MBEDTLS_SSL_VERIFY_NONE);
+  }
+
   mbedtls_ssl_conf_rng(&tls_conf, mbedtls_ctr_drbg_random, &tls_ctr_drbg);
 
   ret = mbedtls_ssl_setup(&tls_ctx, &tls_conf);
@@ -338,8 +365,26 @@ bool MySQL_Packet::start_tls_handshake()
     return false;
   }
 
-  if (tls_sni_host[0] != 0)
-    mbedtls_ssl_set_hostname(&tls_ctx, tls_sni_host);
+  if (tls_ca_pem && !tls_verify_hostname)
+  {
+    // Explicit NULL: recent mbedTLS refuses VERIFY_REQUIRED when no hostname was set at all
+    mbedtls_ssl_set_hostname(&tls_ctx, NULL);
+  }
+  else if (tls_sni_host[0] != 0)
+  {
+    ret = mbedtls_ssl_set_hostname(&tls_ctx, tls_sni_host);
+
+    if (ret != 0)
+    {
+      ESP32_MYSQL_LOGERROR1("TLS set hostname failed, code =", ret);
+      return false;
+    }
+  }
+  else if (tls_ca_pem)
+  {
+    ESP32_MYSQL_LOGERROR("TLS hostname verification requested but no hostname available");
+    return false;
+  }
 
   mbedtls_ssl_set_bio(&tls_ctx, this, tls_send_cb, tls_recv_cb, NULL);
 
@@ -350,6 +395,19 @@ bool MySQL_Packet::start_tls_handshake()
     if ((ret != MBEDTLS_ERR_SSL_WANT_READ) && (ret != MBEDTLS_ERR_SSL_WANT_WRITE))
     {
       ESP32_MYSQL_LOGERROR1("TLS handshake failed, code =", ret);
+
+      if (ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED)
+      {
+        const uint32_t flags = mbedtls_ssl_get_verify_result(&tls_ctx);
+        char info[256];
+
+        mbedtls_x509_crt_verify_info(info, sizeof(info), "", flags);
+        ESP32_MYSQL_LOGERROR1("TLS certificate verification failed:", info);
+
+        if (flags & (MBEDTLS_X509_BADCERT_FUTURE | MBEDTLS_X509_BADCERT_EXPIRED))
+          ESP32_MYSQL_LOGERROR("Check the ESP32 clock (sync it with NTP before connecting)");
+      }
+
       cleanup_tls();
       return false;
     }
@@ -432,7 +490,7 @@ bool MySQL_Packet::encrypt_password_rsa(const uint8_t *pubkey, size_t pubkey_len
 
   rsa_len = mbedtls_pk_get_len(&pk);
 
-  if (rsa_len == 0)
+  if ((rsa_len == 0) || (rsa_len > *encrypted_len))
   {
     ESP32_MYSQL_LOGERROR("Invalid RSA modulus length");
     ret = -1;

@@ -68,6 +68,32 @@ I found a library, which is MySQL_MariaDB_Generic library by Dr. Charles Bell an
 - Supports both `mysql_native_password` and the MySQL 8+ default `caching_sha2_password` (fast-auth path) during the initial handshake.
 - Full RSA/TLS based authentication for `sha256_password` or `caching_sha2_password` full-auth is not yet implemented; servers requesting that path will reject the login.
 
+### TLS and server certificate verification
+
+`conn.enable_tls(true, host)` encrypts the connection, but **without a CA certificate the server is not authenticated** (`VERIFY_NONE`): anyone able to intercept the traffic can impersonate the server and read the password sent during `caching_sha2_password` full-auth.
+
+To verify the server, give the CA that signed its certificate (PEM, for a default MySQL install: `ca.pem` in the data directory):
+
+```cpp
+conn.enable_tls(true, server);
+conn.set_ca_cert(ca_cert);            // VERIFY_REQUIRED, string must stay valid while connecting
+conn.set_tls_verify_hostname(true);   // default; set false if the cert has no matching CN/SAN
+```
+
+- Once a CA is set, the connection fails if the server does not offer TLS (no silent fallback to plaintext).
+- Hostname checking compares the name passed to `connect()` with the certificate CN/SAN. MySQL auto-generated certificates do not contain it: either issue a proper certificate or call `set_tls_verify_hostname(false)` (the CA chain is still verified).
+- Certificate dates are checked, so sync the clock first (`configTime(...)`), otherwise the handshake fails with "certificate not yet valid".
+
+#### Without TLS: pin the server RSA public key
+
+Without TLS, `caching_sha2_password` full-auth encrypts the password with the server RSA public key. By default that key is requested from the server, which is not authenticated: a MITM can send its own key and decrypt the password. Pin the real key instead:
+
+```cpp
+conn.set_server_public_key(server_pubkey);   // PEM, string must stay valid while connecting
+```
+
+The key is `public_key.pem` in the MySQL data directory, or the result of `SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key';`. When it is set, the key is never requested from the server. TLS with `set_ca_cert()` remains the recommended option.
+
 #### Quick auth tests
 
 - `examples/AuthTest_Native_ESP32MySQL` uses a user created with `IDENTIFIED WITH mysql_native_password` to validate the legacy plugin.

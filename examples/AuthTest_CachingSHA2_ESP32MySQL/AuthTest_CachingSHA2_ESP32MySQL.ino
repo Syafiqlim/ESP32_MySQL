@@ -13,6 +13,28 @@
 #define USING_HOST_NAME true
  //true pour TLS, false pour fallback RSA
 #define USE_TLS         true
+ //true pour authentifier le serveur (recommande) : certificat en TLS, cle RSA epinglee sans TLS
+ //false = chiffre mais sans authentification (interception possible)
+#define VERIFY_SERVER   true
+ //false si le certificat ne contient pas le nom/IP du serveur (ex: certificats auto-generes par MySQL)
+#define VERIFY_HOSTNAME true
+
+#if USE_TLS && VERIFY_SERVER
+// CA that signed the MySQL server certificate (for a default install: ca.pem in the MySQL data dir)
+const char ca_cert[] = R"EOF(
+-----BEGIN CERTIFICATE-----
+...paste your CA certificate here...
+-----END CERTIFICATE-----
+)EOF";
+#elif VERIFY_SERVER
+// Server RSA public key for caching_sha2_password (public_key.pem in the MySQL data dir, or
+// SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key';)
+const char server_pubkey[] = R"EOF(
+-----BEGIN PUBLIC KEY-----
+...paste the server public key here...
+-----END PUBLIC KEY-----
+)EOF";
+#endif
 
 #if USING_HOST_NAME
   char server[] = "your-db-host.example.com";   // change to your server's hostname/URL
@@ -46,6 +68,12 @@ void setup()
   #else
     conn.enable_tls(true);
   #endif
+  #if VERIFY_SERVER
+    conn.set_ca_cert(ca_cert);       // Verify the server certificate (no plaintext fallback)
+    conn.set_tls_verify_hostname(VERIFY_HOSTNAME);
+  #endif
+#elif VERIFY_SERVER
+  conn.set_server_public_key(server_pubkey);   // RSA key never requested from the server
 #endif
 
   Serial.println("\nAuth test (caching_sha2_password user)");
@@ -59,6 +87,18 @@ void setup()
   }
   Serial.print("\nWiFi connected. IP: ");
   Serial.println(WiFi.localIP());
+
+#if USE_TLS && VERIFY_SERVER
+  // Certificate validity dates are checked: the clock must be set first
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for NTP time");
+  while (time(nullptr) < 1700000000)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+#endif
 }
 
 void loop()

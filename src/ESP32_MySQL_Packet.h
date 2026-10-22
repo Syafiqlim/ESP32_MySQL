@@ -27,6 +27,7 @@
   #include "mbedtls/rsa.h"
   #include "mbedtls/ssl.h"
   #include "mbedtls/net_sockets.h"
+  #include "mbedtls/x509_crt.h"
 #endif
 
 #define ESP32_MYSQL_OK_PACKET         0x00
@@ -126,6 +127,37 @@ class MySQL_Packet
         tls_sni_host[sizeof(tls_sni_host) - 1] = 0;
       }
     }
+    // Verify the server certificate against this CA (PEM, null-terminated).
+    // The string is not copied: it must stay valid while connecting.
+    // Setting a CA also requests TLS and forbids falling back to plaintext.
+    void    set_ca_cert(const char *ca_pem)
+    {
+      tls_ca_pem = ca_pem;
+
+      if (ca_pem)
+        tls_requested = true;
+    }
+    // Check that the certificate matches the hostname given to connect() (default: true).
+    // Disable it for certificates without the right CN/SAN, e.g. MySQL auto-generated ones.
+    void    set_tls_verify_hostname(bool verify)
+    {
+      tls_verify_hostname = verify;
+    }
+    bool    tls_verification_enabled() const
+    {
+      return tls_ca_pem != NULL;
+    }
+    // Server RSA public key (PEM, null-terminated) used for caching_sha2_password full-auth without TLS.
+    // When set, the key is never requested from the server, so it cannot be swapped by a MITM.
+    // The string is not copied: it must stay valid while connecting.
+    void    set_server_public_key(const char *pubkey_pem)
+    {
+      rsa_pubkey_pem = pubkey_pem;
+    }
+    const char *get_server_public_key() const
+    {
+      return rsa_pubkey_pem;
+    }
     bool    tls_active() const
     {
       return tls_established;
@@ -193,6 +225,9 @@ class MySQL_Packet
     bool tls_requested = false;
     bool tls_established = false;
     char tls_sni_host[64] = { 0 };
+    const char *tls_ca_pem = NULL;
+    bool tls_verify_hostname = true;
+    const char *rsa_pubkey_pem = NULL;
     bool ssl_request_sent = false;
     uint8_t next_sequence_id = 0x01;
     char *cached_password = NULL;
@@ -208,6 +243,7 @@ class MySQL_Packet
     mbedtls_ssl_config tls_conf;
     mbedtls_ctr_drbg_context tls_ctr_drbg;
     mbedtls_entropy_context tls_entropy;
+    mbedtls_x509_crt tls_ca;
 #endif
     bool scramble_password_caching_sha2(char *password, byte *pwd_hash);
     bool scramble_password_sha256(char *password, byte *pwd_hash);

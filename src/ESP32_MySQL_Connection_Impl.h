@@ -132,6 +132,13 @@ bool ESP32_MySQL_Connection::connect(const char *hostname, const uint16_t& port,
   }
   else if (wants_tls() && !tls_possible)
   {
+    if (tls_verification_enabled())
+    {
+      // A CA was configured: never downgrade to plaintext (a MITM could strip CLIENT_SSL)
+      ESP32_MYSQL_LOGERROR("Server does not advertise SSL support, refusing to continue without TLS");
+      return false;
+    }
+
     ESP32_MYSQL_LOGWARN("Server does not advertise SSL support, continuing without TLS");
   }
 
@@ -244,6 +251,13 @@ Connection_Result ESP32_MySQL_Connection::connectNonBlocking(const char *hostnam
   }
   else if (wants_tls() && !tls_possible)
   {
+    if (tls_verification_enabled())
+    {
+      // A CA was configured: never downgrade to plaintext (a MITM could strip CLIENT_SSL)
+      ESP32_MYSQL_LOGERROR("Server does not advertise SSL support, refusing to continue without TLS");
+      return RESULT_FAIL;
+    }
+
     ESP32_MYSQL_LOGWARN("Server does not advertise SSL support, continuing without TLS");
   }
 
@@ -439,39 +453,69 @@ bool ESP32_MySQL_Connection::handle_authentication_result(int depth)
         else
         {
           // Fallback RSA path (no TLS available)
-          const uint8_t request_seq = buffer ? (uint8_t) (buffer[3] + 1) : get_next_sequence_id();
-          uint8_t request[5];
-          store_int(request, 1, 3);
-          request[3] = request_seq;
-          request[4] = 0x02; // request public key
+          const char *pinned_key = get_server_public_key();
+          uint8_t *received_key = NULL;
+          const uint8_t *pubkey = NULL;
+          size_t pubkey_len = 0;
 
-          if (!write_bytes(request, sizeof(request)))
+          if (pinned_key)
           {
-            ESP32_MYSQL_LOGERROR("Failed to request RSA public key");
-            return false;
+            // Pinned key: skip the request, the server's answer could be forged
+            pubkey = (const uint8_t *) pinned_key;
+            pubkey_len = strlen(pinned_key) + 1; // PEM parsing needs the terminating null byte
           }
-
-          set_next_sequence_id(request_seq + 1);
-
-          if (!read_packet())
+          else
           {
-            ESP32_MYSQL_LOGERROR("Failed reading RSA public key packet");
-            return false;
-          }
+            ESP32_MYSQL_LOGWARN("No pinned server public key: the RSA key sent by the server is NOT authenticated");
 
-          if ((packet_len <= 0) || !buffer || (packet_len > MAX_TRANSMISSION_UNIT))
-          {
-            ESP32_MYSQL_LOGERROR("Invalid RSA public key packet");
-            return false;
-          }
+            const uint8_t request_seq = buffer ? (uint8_t) (buffer[3] + 1) : get_next_sequence_id();
+            uint8_t request[5];
+            store_int(request, 1, 3);
+            request[3] = request_seq;
+            request[4] = 0x02; // request public key
 
-          const uint8_t *pubkey = buffer + 4;
-          size_t pubkey_len = packet_len;
+            if (!write_bytes(request, sizeof(request)))
+            {
+              ESP32_MYSQL_LOGERROR("Failed to request RSA public key");
+              return false;
+            }
+
+            set_next_sequence_id(request_seq + 1);
+
+            if (!read_packet())
+            {
+              ESP32_MYSQL_LOGERROR("Failed reading RSA public key packet");
+              return false;
+            }
+
+            // AuthMoreData: 0x01 marker followed by the PEM key, not null-terminated
+            if ((packet_len < 2) || !buffer || (packet_len > MAX_TRANSMISSION_UNIT) || (buffer[4] != 0x01))
+            {
+              ESP32_MYSQL_LOGERROR("Invalid RSA public key packet");
+              return false;
+            }
+
+            pubkey_len = packet_len; // (packet_len - 1) PEM bytes + terminating null
+            received_key = (uint8_t *) malloc(pubkey_len);
+
+            if (!received_key)
+            {
+              ESP32_MYSQL_LOGERROR("Failed to allocate RSA public key buffer");
+              return false;
+            }
+
+            memcpy(received_key, buffer + 5, pubkey_len - 1);
+            received_key[pubkey_len - 1] = 0x00;
+            pubkey = received_key;
+          }
 
           uint8_t encrypted[512];
           size_t encrypted_len = sizeof(encrypted);
 
-          if (!encrypt_password_rsa(pubkey, pubkey_len, pwd, encrypted, &encrypted_len))
+          const bool encrypted_ok = encrypt_password_rsa(pubkey, pubkey_len, pwd, encrypted, &encrypted_len);
+          free(received_key);
+
+          if (!encrypted_ok)
           {
             ESP32_MYSQL_LOGERROR("RSA encryption failed");
             return false;
